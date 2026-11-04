@@ -1,6 +1,7 @@
 import { i18n } from './i18n'
 import { sdk } from './sdk'
 import { MINT_PORT } from './mintEnvironment'
+import { adminUiPort } from './utils'
 
 export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
   const apiMulti = sdk.MultiHost.of(effects, 'api-multi')
@@ -17,5 +18,23 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
     query: {},
   })
 
-  return [await apiOrigin.export([api])]
+  const adminMulti = sdk.MultiHost.of(effects, 'admin-multi')
+  const adminOrigin = await adminMulti.bindPort(adminUiPort, {
+    protocol: 'http',
+  })
+  const admin = sdk.createInterface(effects, {
+    name: i18n('Admin Dashboard'),
+    id: 'admin',
+    description: i18n(
+      'A read-only dashboard of the mint: balances, quotes, keysets and health',
+    ),
+    type: 'ui',
+    masked: false,
+    schemeOverride: null,
+    username: null,
+    path: '',
+    query: {},
+  })
+
+  return [await apiOrigin.export([api]), await adminOrigin.export([admin])]
 })

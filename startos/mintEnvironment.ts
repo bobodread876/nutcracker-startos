@@ -36,12 +36,27 @@ export type MintEnvironmentConfig = {
     rate_limit: boolean
     rate_limit_per_minute: number
   }
+  onchain: {
+    enabled: boolean
+    min_amount: number
+    payout_confirmations: number
+    deposit_confirmations: number
+    sweep_threshold: number
+    sweep_min: number
+    sweep_max_age_hours: number
+  }
 }
 
-export type ClnrestConnection = {
-  address: string
-  rune: string
+/** phoenixd's HTTP API as reached over the StartOS bridge. */
+export type PhoenixdConnection = {
+  url: string
+  password: string
 }
+
+/** The Electrum server the onchain backend reads the chain from, or null. */
+export type OnchainConnection = {
+  electrumUrl: string
+} | null
 
 /** Nutshell's internal HTTP listener. StartOS owns external addressing. */
 export const MINT_PORT = 3338
@@ -50,10 +65,48 @@ export const MINT_HOST = '0.0.0.0'
 /** A directory, not a file — Nutshell writes `mint.sqlite3` inside it. */
 export const MINT_DATABASE = '/data/mint'
 
+/** The onchain deposit wallet: its recovery phrase, wallet database and status. */
+export const ONCHAIN_DIR = '/data/onchain'
+export const DEPOSIT_MNEMONIC_FILE = `${ONCHAIN_DIR}/deposit.mnemonic`
+export const ONCHAIN_STATUS_FILE = `${ONCHAIN_DIR}/status.json`
+
+/** phoenixd keeps no record of payments it rejects up front; the mint does. */
+export const PHOENIXD_FAILED_SENDS_FILE = '/data/phoenixd-failed-sends.jsonl'
+
+/** The onchain backend config Nutshell reads from MINT_PAYMENT_BACKENDS. */
+export const buildOnchainBackend = (
+  onchain: MintEnvironmentConfig['onchain'],
+  phoenixd: PhoenixdConnection,
+  electrumUrl: string,
+): Record<string, unknown> => ({
+  method: 'onchain',
+  unit: 'sat',
+  backend: 'phoenixd',
+  // phoenixd runs on mainnet only.
+  network: 'bitcoin',
+  endpoint: phoenixd.url,
+  password: phoenixd.password,
+  min_amount: onchain.min_amount,
+  confirmations: onchain.payout_confirmations,
+  electrum_url: electrumUrl,
+  sweep_threshold: onchain.sweep_threshold,
+  sweep_min: onchain.sweep_min,
+  sweep_max_age: onchain.sweep_max_age_hours * 3600,
+  status_file: ONCHAIN_STATUS_FILE,
+  deposit_wallet: {
+    mnemonic_file: DEPOSIT_MNEMONIC_FILE,
+    database_path: `${ONCHAIN_DIR}/deposits.sqlite`,
+    confirmations: onchain.deposit_confirmations,
+    min_sync_interval: 60,
+    electrum_timeout: 60,
+  },
+})
+
 export const buildMintEnvironment = (
   config: MintEnvironmentConfig | null,
   seed: string,
-  clnrest: ClnrestConnection,
+  phoenixd: PhoenixdConnection,
+  onchain: OnchainConnection,
 ): Record<string, string> => {
   const mintInfo = config?.mint_info
   const fees = config?.fees
@@ -62,14 +115,16 @@ export const buildMintEnvironment = (
   const env: Record<string, string> = {
     MINT_INFO_NAME: mintInfo?.name || 'My Sovereign Mint',
     MINT_INFO_DESCRIPTION:
-      mintInfo?.description || 'A private Cashu ecash mint.',
+      mintInfo?.description || 'A private Cashu eCash mint.',
     MINT_INFO_DESCRIPTION_LONG: mintInfo?.description_long ?? '',
     MINT_INFO_MOTD: mintInfo?.motd ?? '',
-    MINT_BACKEND_BOLT11_SAT: 'CLNRestWallet',
-    MINT_CLNREST_URL: `http://${clnrest.address}`,
-    MINT_CLNREST_RUNE: clnrest.rune,
+    MINT_BACKEND_BOLT11_SAT: 'PhoenixdWallet',
+    MINT_PHOENIXD_URL: phoenixd.url,
+    MINT_PHOENIXD_API_PASSWORD: phoenixd.password,
+    MINT_PHOENIXD_FAILED_SENDS_FILE: PHOENIXD_FAILED_SENDS_FILE,
     LIGHTNING_FEE_PERCENT: String(fees?.fee_percent ?? 0),
-    LIGHTNING_RESERVE_FEE_MIN: String(fees?.fee_reserve_min ?? 100),
+    // The setting is in sats; Nutshell reads LIGHTNING_RESERVE_FEE_MIN in msat.
+    LIGHTNING_RESERVE_FEE_MIN: String((fees?.fee_reserve_min ?? 100) * 1000),
     MINT_DATABASE,
     MINT_LISTEN_HOST: MINT_HOST,
     MINT_LISTEN_PORT: String(MINT_PORT),
@@ -106,6 +161,12 @@ export const buildMintEnvironment = (
   }
   if (advanced && advanced.max_balance > 0) {
     env.MINT_MAX_BALANCE = String(advanced.max_balance)
+  }
+
+  if (config?.onchain.enabled && onchain) {
+    env.MINT_PAYMENT_BACKENDS = JSON.stringify([
+      buildOnchainBackend(config.onchain, phoenixd, onchain.electrumUrl),
+    ])
   }
 
   return env

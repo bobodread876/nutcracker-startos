@@ -36,7 +36,7 @@ const inputSpec = InputSpec.of({
   max_peg_in: Value.number({
     name: i18n('Maximum Mint Amount'),
     description: i18n(
-      'Largest amount that can be turned into ecash in one operation. 0 is unlimited.',
+      'Largest amount that can be turned into eCash in one operation. 0 is unlimited.',
     ),
     warning: null,
     default: 0,
@@ -78,7 +78,7 @@ const inputSpec = InputSpec.of({
   peg_out_only: Value.toggle({
     name: i18n('Redemptions Only'),
     description: i18n(
-      'Stop issuing new ecash. Existing ecash can still be redeemed to Lightning.',
+      'Stop issuing new eCash. Existing eCash can still be redeemed to Lightning.',
     ),
     warning: null,
     default: false,

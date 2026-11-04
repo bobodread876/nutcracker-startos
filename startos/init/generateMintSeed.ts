@@ -3,7 +3,7 @@ import { sdk } from '../sdk'
 import { mintSeedFile } from '../utils'
 
 /**
- * The mint's ecash seed. Every proof the mint has ever issued is derived from
+ * The mint's eCash seed. Every proof the mint has ever issued is derived from
  * it, so it is generated once and never regenerated: restore replays init as
  * `kind === 'install'`, and without the existence check below a restore would
  * mint a fresh seed and orphan every outstanding token in the restored

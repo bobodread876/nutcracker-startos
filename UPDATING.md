@@ -1,42 +1,49 @@
 # Updating the upstream version
 
-Nutshell runs the official `cashubtc/nutshell` multi-architecture image. The GitHub stable
-release is the source of truth; the matching Docker Hub image is what the package executes.
+Nutcracker builds `./Dockerfile`: the official `cashubtc/nutshell` image, digest-pinned, with Nutshell's source from the `upstream-project/` submodule copied over `/app/cashu` and `patches/*.patch` applied on top. Three pins move together on every bump:
 
-The pin lives in `startos/manifest/index.ts` at `images.main.source.dockerTag`, and it carries
-**both** a tag and a digest — `cashubtc/nutshell:<version>@sha256:<digest>`. A tag alone is not a
-pin: the digest is what makes a rebuild reproduce the image that passed testing.
+| Pin | Where |
+| --- | ----- |
+| Image tag **and** `@sha256` digest | `Dockerfile` (`FROM` line) |
+| Submodule commit at the same tag | `upstream-project/` (`git -C upstream-project checkout <tag>`) |
+| The patches, regenerated against that tag | `patches/` |
 
-## Determining the upstream version
+The admin dashboard moves independently: `admin-ui/` (submodule of bobodread876/cashu-admin-ui) and the `node:22-bookworm-slim` digest in the Dockerfile's first stage. Bump the digest with `docker buildx imagetools inspect node:22-bookworm-slim`; the build fails if `node:sqlite` or the dashboard's dependencies do not load.
 
-```sh
-gh release view -R cashubtc/nutshell --json tagName,publishedAt,url
-```
-
-Ignore prereleases unless the package explicitly intends to ship one.
+The GitHub stable release is the source of truth: `gh release view -R cashubtc/nutshell --json tagName,publishedAt,url`. Ignore prereleases.
 
 ## Review compatibility first
 
-Read every upstream release between the packaged and target versions, and never automate this
-away. Check:
+Read every upstream release between the packaged and target versions. Check:
 
-- database migrations and downgrade safety;
-- renamed or removed environment variables — `startos/mintEnvironment.ts` builds the whole
-  environment, and a renamed variable is not a type error: the mint starts anyway, on defaults;
-- Python command or image working-directory changes (`exec.command` in `startos/main.ts`);
-- CLNRest URL, rune, and transport behavior;
-- data paths and file ownership — `MINT_DATABASE` is a directory, and `mintDatabaseFile` in
-  `startos/utils.ts` reports the filename inside it;
-- supported architectures in the image manifest.
+- database migrations and downgrade safety, and whether upstream now numbers a migration the patches also use (`m043`, `m044` in patch 0001/0003); a clash must be renumbered before release;
+- renamed or removed environment variables (`startos/mintEnvironment.ts` builds the whole environment, and a renamed variable is not a type error);
+- the image's working directory, Python version and command (`exec.command` in `startos/main.ts`);
+- whether upstream merged any patch's feature, which retires that patch (each patch header names the condition);
+- supported architectures, and whether `bdkpython` now publishes a Linux arm64 wheel (if so, add `aarch64` to the manifest and a second hash to `bdk-requirements.txt`).
+
+## Regenerating the patches
+
+The patches come from the `nutcracker/<version>` branch of a Nutshell checkout, rebased onto the new tag. Each patch is a `git diff` restricted to `cashu/`:
+
+```sh
+git -C <nutshell> diff <from> <to> -- cashu > patches/000N-<name>.patch   # keep the header block
+```
+
+Then confirm they apply to the exact source in the new image:
+
+```sh
+docker create --name n cashubtc/nutshell:<version>@sha256:<digest>
+docker cp n:/app/cashu /tmp/img-cashu && docker rm n
+diff -r upstream-project/cashu /tmp/img-cashu          # must be identical
+cd /tmp && for p in <repo>/patches/*.patch; do patch -p1 --forward --batch < "$p"; done
+```
+
+Run the full Nutshell test suite on the rebased branch before regenerating; the patches are only as good as that run.
 
 ## Applying the bump
 
-Confirm the tag exists and record its multi-architecture index digest:
-
-```sh
-docker buildx imagetools inspect cashubtc/nutshell:<version>
-```
-
-Verify the index contains `linux/amd64` and `linux/arm64`, then:
-
-1. `startos/manifest/index.ts` — set `dockerTag` to `cashubtc/nutshell:<version>@sha256:<digest>`.
+1. `docker buildx imagetools inspect cashubtc/nutshell:<version>`: record the index digest and confirm `linux/amd64` is present.
+2. `Dockerfile`: set the `FROM` tag and digest.
+3. `upstream-project/`: check out the same tag.
+4. `patches/`: regenerate as above.

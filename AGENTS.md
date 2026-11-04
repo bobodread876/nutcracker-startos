@@ -34,7 +34,9 @@ verified, tried, and decided belongs in the commit message and the PR body.
 
 ## This repo
 
-- **Never make the seed write in `init/generateMintSeed.ts` unconditional.** Restore replays init as `kind === 'install'`, and a fresh `mint_private_key` orphans every token the mint has issued.
-- **Bump the image's `@sha256` digest together with its tag** in `startos/manifest/index.ts`, as `UPDATING.md` describes; a tag alone is not a bump.
+- **Never make the seed write in `init/generateMintSeed.ts` unconditional.** Restore replays init as `kind === 'install'`, and a fresh `mint_private_key` orphans every token the mint has issued. The same holds for the deposit phrase: the `deposit-wallet` oneshot in `main.ts` opens it with `O_EXCL` and must never overwrite it.
+- **Bump the `Dockerfile` digest, the `upstream-project` submodule and `patches/` together**, as `UPDATING.md` describes; any one alone builds a different mint than the one tested.
+- **Mount `main` read-only into the dashboard except the `mint/` database folder, and keep its task `important`.** The seed and deposit wallet must stay out of the dashboard's reach; `mint/` has to be writable or SQLite cannot open the idle WAL database at all (verified against a running Nutshell 0.22.1); and a `critical` task would stop the mint itself from starting until a dashboard password exists.
 - **Keep `startos/mintEnvironment.ts` import-free.** `tests/mint-environment.test.ts` runs it under plain `node --test`, where a relative import breaks the test.
-- **Keep `main.ts` refusing to start when CLNRest's address or rune can't be read.** A mint without a Lightning backend takes deposits it cannot settle.
+- **Keep `main.ts` refusing to start when phoenixd's address or password can't be read, or when onchain is on and Fulcrum is unreachable.** A mint without its backend takes deposits it cannot settle.
+- **Don't import constants from `phoenixd-startos` or `fulcrum-startos`, or widen `tsconfig.json`'s `include` to `node_modules`.** Both pull in `electrs-startos`, whose `#next` does not type-check; the ids and ports are inlined in `startos/utils.ts`.

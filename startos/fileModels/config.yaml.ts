@@ -4,7 +4,7 @@ import { sdk } from '../sdk'
 const mintInfoShape = z
   .looseObject({
     name: z.string().catch('My Sovereign Mint'),
-    description: z.string().catch('A private Cashu ecash mint.'),
+    description: z.string().catch('A private Cashu eCash mint.'),
     description_long: z.string().catch(''),
     motd: z.string().catch(''),
     contact_email: z.string().catch(''),
@@ -15,7 +15,7 @@ const mintInfoShape = z
   })
   .catch({
     name: 'My Sovereign Mint',
-    description: 'A private Cashu ecash mint.',
+    description: 'A private Cashu eCash mint.',
     description_long: '',
     motd: '',
     contact_email: '',
@@ -54,10 +54,31 @@ const advancedShape = z
     rate_limit_per_minute: 60,
   })
 
+const onchainShape = z
+  .looseObject({
+    enabled: z.boolean().catch(false),
+    min_amount: z.number().int().min(1).catch(10_000),
+    payout_confirmations: z.number().int().min(1).catch(1),
+    deposit_confirmations: z.number().int().min(1).catch(3),
+    sweep_threshold: z.number().int().min(1).catch(500_000),
+    sweep_min: z.number().int().min(1).catch(50_000),
+    sweep_max_age_hours: z.number().int().min(1).catch(24),
+  })
+  .catch({
+    enabled: false,
+    min_amount: 10_000,
+    payout_confirmations: 1,
+    deposit_confirmations: 3,
+    sweep_threshold: 500_000,
+    sweep_min: 50_000,
+    sweep_max_age_hours: 24,
+  })
+
 const shape = z.looseObject({
   mint_info: mintInfoShape,
   fees: feesShape,
   advanced: advancedShape,
+  onchain: onchainShape,
 })
 
 export type ConfigType = z.infer<typeof shape>

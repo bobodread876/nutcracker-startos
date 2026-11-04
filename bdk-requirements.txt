@@ -1,0 +1,2 @@
+bdkpython==0.32.1 \
+    --hash=sha256:2a55b0f2955c2fbe41a6aacc60e278647aec9cfa6f24b950460052d5a5b9ccb7

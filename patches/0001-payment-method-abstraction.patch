@@ -1,0 +1,3764 @@
+From: Nutcracker <bobodread876@users.noreply.github.com>
+Subject: [PATCH] payment-method abstraction, adapted to the 0.22 melt lifecycle
+
+Retires when: cashubtc/nutshell merges PR #1131 (payment-method abstraction) in a release this package ships.
+Generated from the nutcracker/0.22.1 branch of Nutshell (see UPDATING.md), commits 3ab0137b..5ecd0646
+
+---
+ cashu/core/base.py                          |  34 ++-
+ cashu/core/json_rpc/base.py                 |   2 +
+ cashu/core/models/info.py                   |  11 +-
+ cashu/core/models/melt_quote.py             |  26 ++-
+ cashu/core/models/mint_quote.py             |  30 ++-
+ cashu/core/settings.py                      |   8 +-
+ cashu/lightning/base.py                     |   9 +
+ cashu/mint/cache.py                         |  19 +-
+ cashu/mint/crud.py                          |  26 ++-
+ cashu/mint/db/write.py                      |  89 +++++++-
+ cashu/mint/events/event_model.py            |   2 +-
+ cashu/mint/events/events.py                 |   4 +
+ cashu/mint/features.py                      |  58 +++--
+ cashu/mint/ledger.py                        | 323 +++++++++++++++++-----------
+ cashu/mint/management_rpc/management_rpc.py |   9 +-
+ cashu/mint/migrations.py                    |  37 ++++
+ cashu/mint/protocols.py                     |   6 +-
+ cashu/mint/router.py                        | 186 +++++++++-------
+ cashu/mint/startup.py                       |  32 ++-
+ cashu/mint/tasks.py                         |  58 +++--
+ cashu/mint/verification.py                  |  18 +-
+ cashu/mint/watchdog.py                      |  22 +-
+ cashu/payment/__init__.py                   |  21 ++
+ cashu/payment/base.py                       | 143 ++++++++++++
+ cashu/payment/bolt11.py                     |  84 ++++++++
+ cashu/payment/registry.py                   |  67 ++++++
+ cashu/wallet/cli/cli.py                     | 119 +++++++---
+ cashu/wallet/crud.py                        | 143 ++++++++++++
+ cashu/wallet/migrations.py                  |  51 +++++
+ cashu/wallet/v1_api.py                      | 143 ++++++++++--
+ cashu/wallet/wallet.py                      | 178 ++++++++++++---
+ 31 files changed, 1575 insertions(+), 383 deletions(-)
+
+diff --git a/cashu/core/base.py b/cashu/core/base.py
+index 091c5279..f3c03bc3 100644
+--- a/cashu/core/base.py
++++ b/cashu/core/base.py
+@@ -304,6 +304,7 @@ class MeltQuote(LedgerEvent):
+     expiry: Optional[int] = None
+     change: Optional[List[BlindedSignature]] = None
+     mint: Optional[str] = None
++    method_data: Dict[str, Any] = Field(default_factory=dict)
+ 
+     @classmethod
+     def from_row(cls, row: Row, change: Optional[List[BlindedSignature]] = None):
+@@ -343,13 +344,18 @@ class MeltQuote(LedgerEvent):
+             change=change,
+             expiry=expiry,
+             payment_preimage=payment_preimage,
++            method_data=(
++                json.loads(row["method_data"])
++                if "method_data" in row.keys() and row["method_data"]
++                else {}
++            ),
+         )
+ 
+     @classmethod
+     def from_resp_wallet(cls, melt_quote_resp, mint: str):
+         return cls(
+             quote=melt_quote_resp.quote,
+-            method=Method.bolt11.name,
++            method=melt_quote_resp.method,
+             request=melt_quote_resp.request,
+             checking_id="",
+             unit=melt_quote_resp.unit,
+@@ -358,6 +364,7 @@ class MeltQuote(LedgerEvent):
+             state=MeltQuoteState(melt_quote_resp.state),
+             mint=mint,
+             change=melt_quote_resp.change,
++            method_data=melt_quote_resp.model_extra or {},
+         )
+ 
+     @property
+@@ -366,8 +373,12 @@ class MeltQuote(LedgerEvent):
+         return self.quote
+ 
+     @property
+-    def kind(self) -> JSONRPCSubscriptionKinds:
+-        return JSONRPCSubscriptionKinds.BOLT11_MELT_QUOTE
++    def kind(self) -> Union[JSONRPCSubscriptionKinds, str]:
++        kind = f"{self.method}_melt_quote"
++        try:
++            return JSONRPCSubscriptionKinds(kind)
++        except ValueError:
++            return kind
+ 
+     @property
+     def unpaid(self) -> bool:
+@@ -434,6 +445,7 @@ class MintQuote(LedgerEvent):
+     amount_paid: Optional[int] = 0
+     amount_issued: Optional[int] = 0
+     updated_at: Optional[int] = Field(default_factory=lambda: int(time.time()))
++    method_data: Dict[str, Any] = Field(default_factory=dict)
+ 
+     def __init__(self, **data: Any):
+         if "state" in data and "state_val" not in data:
+@@ -497,6 +509,11 @@ class MintQuote(LedgerEvent):
+             updated_at=updated_at
+             if updated_at is not None
+             else (issued_time or paid_time or created_time or int(time.time())),
++            method_data=(
++                json.loads(row["method_data"])
++                if "method_data" in row.keys() and row["method_data"]
++                else {}
++            ),
+         )
+ 
+     @classmethod
+@@ -539,7 +556,7 @@ class MintQuote(LedgerEvent):
+ 
+         return cls(
+             quote=mint_quote_resp.quote,
+-            method=Method.bolt11.name,
++            method=mint_quote_resp.method,
+             request=mint_quote_resp.request,
+             checking_id="",
+             unit=mint_quote_resp.unit,
+@@ -554,6 +571,7 @@ class MintQuote(LedgerEvent):
+             amount_paid=mint_quote_resp.amount_paid,
+             amount_issued=mint_quote_resp.amount_issued,
+             updated_at=mint_quote_resp.updated_at,
++            method_data=mint_quote_resp.model_extra or {},
+         )
+ 
+     @classmethod
+@@ -639,8 +657,12 @@ class MintQuote(LedgerEvent):
+         return self.quote
+ 
+     @property
+-    def kind(self) -> JSONRPCSubscriptionKinds:
+-        return JSONRPCSubscriptionKinds.BOLT11_MINT_QUOTE
++    def kind(self) -> Union[JSONRPCSubscriptionKinds, str]:
++        kind = f"{self.method}_mint_quote"
++        try:
++            return JSONRPCSubscriptionKinds(kind)
++        except ValueError:
++            return kind
+ 
+     @property
+     def unpaid(self) -> bool:
+diff --git a/cashu/core/json_rpc/base.py b/cashu/core/json_rpc/base.py
+index 7628eed8..c9e214c2 100644
+--- a/cashu/core/json_rpc/base.py
++++ b/cashu/core/json_rpc/base.py
+@@ -60,6 +60,8 @@ class JSONRPCMethods(Enum):
+ class JSONRPCSubscriptionKinds(Enum):
+     BOLT11_MINT_QUOTE = "bolt11_mint_quote"
+     BOLT11_MELT_QUOTE = "bolt11_melt_quote"
++    BOLT12_MINT_QUOTE = "bolt12_mint_quote"
++    BOLT12_MELT_QUOTE = "bolt12_melt_quote"
+     PROOF_STATE = "proof_state"
+ 
+ 
+diff --git a/cashu/core/models/info.py b/cashu/core/models/info.py
+index a62949c3..1e3f9a70 100644
+--- a/cashu/core/models/info.py
++++ b/cashu/core/models/info.py
+@@ -1,11 +1,13 @@
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, Union
+ 
+-from pydantic import BaseModel
++from pydantic import BaseModel, ConfigDict
+ 
+ from ..nuts.nuts import BOOLEAN_SUPPORTED_NUTS
+ 
+ 
+ class MintMethodBolt11OptionSetting(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
+     description: Optional[bool] = None
+ 
+ 
+@@ -15,7 +17,9 @@ class MintMethodSetting(BaseModel):
+     method_name: Optional[str] = None
+     min_amount: Optional[int] = None
+     max_amount: Optional[int] = None
+-    options: Optional[MintMethodBolt11OptionSetting] = None
++    # BOLT11 historically exposes an attribute-based options model. Keep this
++    # field open so other methods may publish their own typed option model.
++    options: Optional[Union[MintMethodBolt11OptionSetting, Dict[str, Any]]] = None
+ 
+ 
+ class MeltMethodSetting(BaseModel):
+@@ -24,6 +28,7 @@ class MeltMethodSetting(BaseModel):
+     method_name: Optional[str] = None
+     min_amount: Optional[int] = None
+     max_amount: Optional[int] = None
++    options: Optional[Dict[str, Any]] = None
+ 
+ 
+ class MintInfoContact(BaseModel):
+diff --git a/cashu/core/models/melt_quote.py b/cashu/core/models/melt_quote.py
+index e69bdad3..c4ff16df 100644
+--- a/cashu/core/models/melt_quote.py
++++ b/cashu/core/models/melt_quote.py
+@@ -1,6 +1,6 @@
+ from typing import List, Optional, Union
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, ConfigDict, Field
+ 
+ from cashu.core.base import BlindedSignature, MeltQuote
+ from cashu.core.constants import MAX_PAYMENT_REQUEST_LEN, MAX_UNIT_LEN
+@@ -15,6 +15,8 @@ class PostMeltRequestOptions(BaseModel):
+ 
+ 
+ class PostMeltQuoteRequest(BaseModel):
++    model_config = ConfigDict(extra="allow")
++
+     unit: str = Field(..., max_length=MAX_UNIT_LEN)  # input unit
+     request: str = Field(
+         ..., max_length=MAX_PAYMENT_REQUEST_LEN
+@@ -38,6 +40,8 @@ class PostMeltQuoteRequest(BaseModel):
+ 
+ 
+ class PostMeltQuoteResponse(BaseModel):
++    model_config = ConfigDict(extra="allow")
++
+     quote: str  # quote id
+     amount: int  # input amount
+     unit: str  # input unit
+@@ -51,7 +55,19 @@ class PostMeltQuoteResponse(BaseModel):
+ 
+     @classmethod
+     def from_melt_quote(cls, melt_quote: MeltQuote) -> "PostMeltQuoteResponse":
+-        to_dict = melt_quote.model_dump()
+-        # turn state into string
+-        to_dict["state"] = melt_quote.state.value
+-        return cls.model_validate(to_dict)
++        # Keep internal settlement identifiers and timestamps off the wire while
++        # allowing a payment method to add its own protocol fields.
++        response = {
++            "quote": melt_quote.quote,
++            "amount": melt_quote.amount,
++            "unit": melt_quote.unit,
++            "method": melt_quote.method,
++            "request": melt_quote.request,
++            "fee_reserve": melt_quote.fee_reserve,
++            "state": melt_quote.state.value,
++            "expiry": melt_quote.expiry,
++            "payment_preimage": melt_quote.payment_preimage,
++            "change": melt_quote.change,
++        }
++        response.update(melt_quote.method_data)
++        return cls.model_validate(response)
+diff --git a/cashu/core/models/mint_quote.py b/cashu/core/models/mint_quote.py
+index b400596f..9a42c537 100644
+--- a/cashu/core/models/mint_quote.py
++++ b/cashu/core/models/mint_quote.py
+@@ -1,6 +1,6 @@
+ from typing import Annotated, List, Optional
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, ConfigDict, Field
+ 
+ from cashu.core.base import MintQuote
+ from cashu.core.constants import (
+@@ -13,6 +13,8 @@ from cashu.core.settings import settings
+ 
+ 
+ class PostMintQuoteRequest(BaseModel):
++    model_config = ConfigDict(extra="allow")
++
+     unit: str = Field(..., max_length=MAX_UNIT_LEN)  # output unit
+     amount: int = Field(..., gt=0)  # output amount
+     description: Optional[str] = Field(
+@@ -30,6 +32,8 @@ class PostMintQuoteCheckRequest(BaseModel):
+ 
+ 
+ class PostMintQuoteResponse(BaseModel):
++    model_config = ConfigDict(extra="allow")
++
+     quote: str  # quote id
+     request: str  # input payment request
+     amount: int  # output amount
+@@ -44,10 +48,20 @@ class PostMintQuoteResponse(BaseModel):
+ 
+     @classmethod
+     def from_mint_quote(cls, mint_quote: MintQuote) -> "PostMintQuoteResponse":
+-        to_dict = mint_quote.model_dump()
+-        # turn state into string
+-        to_dict["state"] = mint_quote.state.value
+-        to_dict["amount_paid"] = mint_quote.amount_paid
+-        to_dict["amount_issued"] = mint_quote.amount_issued
+-        to_dict["updated_at"] = mint_quote.updated_at
+-        return cls.model_validate(to_dict)
++        # Build the public wire object explicitly. MintQuote also contains internal
++        # fields (for example checking_id) which must never become response extras.
++        response = {
++            "quote": mint_quote.quote,
++            "request": mint_quote.request,
++            "amount": mint_quote.amount,
++            "unit": mint_quote.unit,
++            "method": mint_quote.method,
++            "amount_paid": mint_quote.amount_paid,
++            "amount_issued": mint_quote.amount_issued,
++            "updated_at": mint_quote.updated_at,
++            "state": mint_quote.state.value,
++            "expiry": mint_quote.expiry,
++            "pubkey": mint_quote.pubkey,
++        }
++        response.update(mint_quote.method_data)
++        return cls.model_validate(response)
+diff --git a/cashu/core/settings.py b/cashu/core/settings.py
+index be174ed4..8ab636a3 100644
+--- a/cashu/core/settings.py
++++ b/cashu/core/settings.py
+@@ -1,7 +1,7 @@
+ import os
+ import sys
+ from pathlib import Path
+-from typing import List, Optional
++from typing import Any, Dict, List, Optional
+ 
+ from dotenv import load_dotenv
+ from pydantic import Field
+@@ -114,6 +114,12 @@ class MintBackends(MintSettings):
+     mint_backend_bolt11_msat: str = Field(default="")
+     mint_backend_bolt11_usd: str = Field(default="")
+     mint_backend_bolt11_eur: str = Field(default="")
++    # Entry-point names in the ``cashu.payment_methods`` group. Plugins are never
++    # auto-loaded merely because they are installed.
++    mint_payment_method_plugins: List[str] = Field(default=[])
++    # Additive structured backend declarations for non-BOLT11 methods. Legacy
++    # BOLT11 variables above remain supported and authoritative.
++    mint_payment_backends: List[Dict[str, Any]] = Field(default=[])
+ 
+     mint_strike_key: Optional[str] = Field(default=None)
+ 
+diff --git a/cashu/lightning/base.py b/cashu/lightning/base.py
+index 3c58816a..2e8c0490 100644
+--- a/cashu/lightning/base.py
++++ b/cashu/lightning/base.py
+@@ -23,12 +23,16 @@ class InvoiceQuoteResponse(BaseModel):
+ 
+ 
+ class PaymentQuoteResponse(BaseModel):
++    model_config = {"extra": "allow"}
++
+     checking_id: str
+     amount: Amount
+     fee: Amount
+ 
+ 
+ class InvoiceResponse(BaseModel):
++    model_config = {"extra": "allow"}
++
+     ok: bool  # True: invoice created, False: failed
+     checking_id: Optional[str] = None
+     payment_request: Optional[str] = None
+@@ -49,6 +53,8 @@ class PaymentResult(Enum):
+ 
+ 
+ class PaymentResponse(BaseModel):
++    model_config = {"extra": "allow"}
++
+     result: PaymentResult
+     checking_id: Optional[str] = None
+     fee: Optional[Amount] = None
+@@ -88,10 +94,13 @@ class PaymentStatusResult(Enum):
+ 
+ 
+ class PaymentStatus(BaseModel):
++    model_config = {"extra": "allow"}
++
+     result: PaymentStatusResult
+     fee: Optional[Amount] = None
+     preimage: Optional[str] = None
+     error_message: Optional[str] = None
++    amount_paid: Optional[Amount] = None
+ 
+     @property
+     def pending(self) -> bool:
+diff --git a/cashu/mint/cache.py b/cashu/mint/cache.py
+index 48658f45..7052afe5 100644
+--- a/cashu/mint/cache.py
++++ b/cashu/mint/cache.py
+@@ -100,7 +100,14 @@ class RedisCache:
+         except RedisError:
+             self._redis_failed()
+ 
+-    async def _execute(self, func, request: Request, payload: BaseModel, key: str):
++    async def _execute(
++        self,
++        func,
++        request: Request,
++        payload: BaseModel,
++        route_parameters: dict[str, Any],
++        key: str,
++    ):
+         # Retain the existing Redis key format so deployed caches remain readable.
+         memory_key = hashlib.sha256(key.encode()).hexdigest()
+         try:
+@@ -116,7 +123,7 @@ class RedisCache:
+                 except RedisError:
+                     self._redis_failed()
+ 
+-            result = await func(request, payload)
++            result = await func(request=request, payload=payload, **route_parameters)
+             serialized = result.model_dump_json()
+             self.memory.set(
+                 memory_key, serialized.encode(), settings.mint_redis_cache_ttl
+@@ -142,11 +149,15 @@ class RedisCache:
+     def cache(self):
+         def decorator(func):
+             @functools.wraps(func)
+-            async def wrapper(request: Request, payload: BaseModel):
++            async def wrapper(
++                request: Request, payload: BaseModel, **route_parameters: Any
++            ):
+                 key = request.url.path + payload.model_dump_json()
+                 task = self._inflight.get(key)
+                 if task is None:
+-                    task = asyncio.create_task(self._execute(func, request, payload, key))
++                    task = asyncio.create_task(
++                        self._execute(func, request, payload, route_parameters, key)
++                    )
+                     self._inflight[key] = task
+                     task.add_done_callback(self._consume_exception)
+                 # Finish and cache successful operations even if the caller disconnects.
+diff --git a/cashu/mint/crud.py b/cashu/mint/crud.py
+index b2b36925..25c953e2 100644
+--- a/cashu/mint/crud.py
++++ b/cashu/mint/crud.py
+@@ -249,6 +249,7 @@ class LedgerCrud(ABC):
+         quote_id: Optional[str] = None,
+         checking_id: Optional[str] = None,
+         request: Optional[str] = None,
++        method: Optional[str] = None,
+         db: Database,
+         conn: Optional[Connection] = None,
+     ) -> Optional[MintQuote]: ...
+@@ -287,6 +288,7 @@ class LedgerCrud(ABC):
+         quote_id: Optional[str] = None,
+         checking_id: Optional[str] = None,
+         request: Optional[str] = None,
++        method: Optional[str] = None,
+         db: Database,
+         conn: Optional[Connection] = None,
+     ) -> Optional[MeltQuote]: ...
+@@ -626,8 +628,8 @@ class LedgerCrudSqlite(LedgerCrud):
+         await (conn or db).execute(
+             f"""
+             INSERT INTO {db.table_with_schema("mint_quotes")}
+-            (quote, method, request, checking_id, unit, amount, state, created_time, paid_time, issued_time, last_checked, pubkey, amount_paid, amount_issued, updated_at)
+-            VALUES (:quote, :method, :request, :checking_id, :unit, :amount, :state, :created_time, :paid_time, :issued_time, :last_checked, :pubkey, :amount_paid, :amount_issued, :updated_at)
++            (quote, method, request, checking_id, unit, amount, state, created_time, paid_time, issued_time, last_checked, pubkey, amount_paid, amount_issued, updated_at, method_data)
++            VALUES (:quote, :method, :request, :checking_id, :unit, :amount, :state, :created_time, :paid_time, :issued_time, :last_checked, :pubkey, :amount_paid, :amount_issued, :updated_at, :method_data)
+             """,
+             {
+                 "quote": quote.quote,
+@@ -663,6 +665,7 @@ class LedgerCrudSqlite(LedgerCrud):
+                 )
+                 if quote.updated_at
+                 else None,
++                "method_data": json.dumps(quote.method_data),
+             },
+         )
+ 
+@@ -672,6 +675,7 @@ class LedgerCrudSqlite(LedgerCrud):
+         quote_id: Optional[str] = None,
+         checking_id: Optional[str] = None,
+         request: Optional[str] = None,
++        method: Optional[str] = None,
+         db: Database,
+         conn: Optional[Connection] = None,
+     ) -> Optional[MintQuote]:
+@@ -686,6 +690,9 @@ class LedgerCrudSqlite(LedgerCrud):
+         if request:
+             clauses.append("request = :request")
+             values["request"] = request
++        if method:
++            clauses.append("method = :method")
++            values["method"] = method
+         if not any(clauses):
+             raise ValueError("No search criteria")
+         where = f"WHERE {' AND '.join(clauses)}"
+@@ -724,7 +731,7 @@ class LedgerCrudSqlite(LedgerCrud):
+         conn: Optional[Connection] = None,
+     ) -> None:
+         await (conn or db).execute(
+-            f"UPDATE {db.table_with_schema('mint_quotes')} SET state = :state, paid_time = :paid_time, issued_time = :issued_time, last_checked = :last_checked, amount_paid = :amount_paid, amount_issued = :amount_issued, updated_at = :updated_at WHERE quote = :quote",
++            f"UPDATE {db.table_with_schema('mint_quotes')} SET state = :state, paid_time = :paid_time, issued_time = :issued_time, last_checked = :last_checked, amount_paid = :amount_paid, amount_issued = :amount_issued, updated_at = :updated_at, method_data = :method_data WHERE quote = :quote",
+             {
+                 "state": quote.state.value,
+                 "paid_time": db.to_timestamp(
+@@ -750,6 +757,7 @@ class LedgerCrudSqlite(LedgerCrud):
+                 if quote.updated_at
+                 else None,
+                 "quote": quote.quote,
++                "method_data": json.dumps(quote.method_data),
+             },
+         )
+ 
+@@ -788,8 +796,8 @@ class LedgerCrudSqlite(LedgerCrud):
+         await (conn or db).execute(
+             f"""
+             INSERT INTO {db.table_with_schema("melt_quotes")}
+-            (quote, method, request, checking_id, unit, amount, fee_reserve, state, created_time, paid_time, fee_paid, proof, expiry)
+-            VALUES (:quote, :method, :request, :checking_id, :unit, :amount, :fee_reserve, :state, :created_time, :paid_time, :fee_paid, :proof, :expiry)
++            (quote, method, request, checking_id, unit, amount, fee_reserve, state, created_time, paid_time, fee_paid, proof, expiry, method_data)
++            VALUES (:quote, :method, :request, :checking_id, :unit, :amount, :fee_reserve, :state, :created_time, :paid_time, :fee_paid, :proof, :expiry, :method_data)
+             """,
+             {
+                 "quote": quote.quote,
+@@ -813,6 +821,7 @@ class LedgerCrudSqlite(LedgerCrud):
+                 "expiry": db.to_timestamp(
+                     db.timestamp_from_seconds(quote.expiry) or ""
+                 ),
++                "method_data": json.dumps(quote.method_data),
+             },
+         )
+ 
+@@ -822,6 +831,7 @@ class LedgerCrudSqlite(LedgerCrud):
+         quote_id: Optional[str] = None,
+         checking_id: Optional[str] = None,
+         request: Optional[str] = None,
++        method: Optional[str] = None,
+         db: Database,
+         conn: Optional[Connection] = None,
+     ) -> Optional[MeltQuote]:
+@@ -836,6 +846,9 @@ class LedgerCrudSqlite(LedgerCrud):
+         if request:
+             clauses.append("request = :request")
+             values["request"] = request
++        if method:
++            clauses.append("method = :method")
++            values["method"] = method
+         if not any(clauses):
+             raise ValueError("No search criteria")
+         where = f"WHERE {' AND '.join(clauses)}"
+@@ -880,7 +893,7 @@ class LedgerCrudSqlite(LedgerCrud):
+     ) -> None:
+         await (conn or db).execute(
+             f"""
+-            UPDATE {db.table_with_schema("melt_quotes")} SET state = :state, fee_paid = :fee_paid, paid_time = :paid_time, proof = :proof, checking_id = :checking_id, attempt = :attempt, melt_lock = :melt_lock, melt_lock_expires_at = :melt_lock_expires_at, payment_uncertain = :payment_uncertain WHERE quote = :quote
++            UPDATE {db.table_with_schema("melt_quotes")} SET state = :state, fee_paid = :fee_paid, paid_time = :paid_time, proof = :proof, checking_id = :checking_id, attempt = :attempt, melt_lock = :melt_lock, melt_lock_expires_at = :melt_lock_expires_at, payment_uncertain = :payment_uncertain, method_data = :method_data WHERE quote = :quote
+             """,
+             {
+                 "state": quote.state.value,
+@@ -897,6 +910,7 @@ class LedgerCrudSqlite(LedgerCrud):
+                 "melt_lock": quote.melt_lock,
+                 "melt_lock_expires_at": quote.melt_lock_expires_at,
+                 "payment_uncertain": int(quote.payment_uncertain),
++                "method_data": json.dumps(quote.method_data),
+             },
+         )
+ 
+diff --git a/cashu/mint/db/write.py b/cashu/mint/db/write.py
+index 4a19ed4a..c2d7d8b3 100644
+--- a/cashu/mint/db/write.py
++++ b/cashu/mint/db/write.py
+@@ -62,14 +62,65 @@ class DbWriteHelper:
+         self.db_read = db_read
+ 
+     @staticmethod
+-    def _set_mint_quote_state(quote: MintQuote, state: MintQuoteState) -> None:
+-        """Set a mint quote state and its corresponding timestamps."""
++    def _update_mint_quote_state_timestamps(
++        quote: MintQuote, state: MintQuoteState
++    ) -> None:
++        """Update timestamps associated with a mint quote state transition."""
+         now = int(time.time())
+-        quote.state = state
+         quote.updated_at = now
+         if state == MintQuoteState.issued and not quote.issued_time:
+             quote.issued_time = now
+ 
++    @classmethod
++    def _set_mint_quote_state(cls, quote: MintQuote, state: MintQuoteState) -> None:
++        """Set a mint quote state and its corresponding timestamps."""
++        quote.state = state
++        cls._update_mint_quote_state_timestamps(quote, state)
++
++    @classmethod
++    def _restore_mint_quote_state(cls, quote: MintQuote, state: MintQuoteState) -> None:
++        """Restore a transient state without changing cumulative accounting."""
++        quote.state_val = state
++        cls._update_mint_quote_state_timestamps(quote, state)
++
++    @staticmethod
++    def _ensure_mint_quote_accounting(quote: MintQuote) -> None:
++        """Initialize cumulative fields on quotes created before accounting existed."""
++        if quote.amount_paid is not None and quote.amount_issued is not None:
++            return
++        state = quote.state
++        quote.amount_paid = (
++            quote.amount
++            if state
++            in {
++                MintQuoteState.paid,
++                MintQuoteState.issued,
++            }
++            else 0
++        )
++        quote.amount_issued = quote.amount if state == MintQuoteState.issued else 0
++
++    @classmethod
++    def _apply_mint_quote_issuance(cls, quote: MintQuote, issued_amount: int) -> None:
++        """Apply an issuance amount and derive the quote's resulting state."""
++        amount_paid = quote.amount_paid or 0
++        new_amount_issued = (quote.amount_issued or 0) + issued_amount
++        if new_amount_issued > amount_paid:
++            raise TransactionError("mint amount exceeds paid quote balance")
++
++        previous_updated_at = quote.updated_at or 0
++        quote.amount_issued = new_amount_issued
++        next_state = (
++            MintQuoteState.issued
++            if new_amount_issued == amount_paid
++            else MintQuoteState.paid
++        )
++        # Do not use quote.state here: its legacy setter resets cumulative
++        # accounting fields, which reusable payment methods must preserve.
++        quote.state_val = next_state
++        cls._update_mint_quote_state_timestamps(quote, next_state)
++        quote.updated_at = max(quote.updated_at or 0, previous_updated_at + 1)
++
+     async def _verify_spent_proofs_and_set_pending(
+         self,
+         proofs: List[Proof],
+@@ -242,6 +293,7 @@ class DbWriteHelper:
+             if not quote.paid:
+                 raise QuoteNotPaidError("Mint quote is not paid yet.")
+             # set the quote as pending
++            self._ensure_mint_quote_accounting(quote)
+             self._set_mint_quote_state(quote, MintQuoteState.pending)
+             logger.trace(f"crud: setting quote {quote_id} as PENDING")
+             await self.crud.update_mint_quote(quote=quote, db=self.db, conn=conn)
+@@ -293,6 +345,7 @@ class DbWriteHelper:
+                     raise QuoteNotPaidError(f"Mint quote {quote_id} is not paid yet.")
+ 
+                 # set the quote as pending
++                self._ensure_mint_quote_accounting(quote)
+                 self._set_mint_quote_state(quote, MintQuoteState.pending)
+                 logger.trace(f"crud: setting quote {quote_id} as PENDING")
+                 await self.crud.update_mint_quote(quote=quote, db=self.db, conn=conn)
+@@ -300,7 +353,10 @@ class DbWriteHelper:
+         return quotes
+ 
+     async def _unset_mint_quote_pending(
+-        self, quote_id: str, state: MintQuoteState
++        self,
++        quote_id: str,
++        state: MintQuoteState,
++        issued_amount: Optional[int] = None,
+     ) -> MintQuote:
+         """Unsets the mint quote as pending.
+ 
+@@ -328,8 +384,12 @@ class DbWriteHelper:
+                 raise TransactionError(
+                     f"Mint quote not pending: {quote.state.value}. Cannot set as {state.value}."
+                 )
+-            # set the quote to previous state
+-            self._set_mint_quote_state(quote, state)
++            # Reusable payment methods may issue only part of the currently paid
++            # balance. Keep accounting changes inside the quote lock.
++            if state == MintQuoteState.issued and issued_amount is not None:
++                self._apply_mint_quote_issuance(quote, issued_amount)
++            else:
++                self._restore_mint_quote_state(quote, state)
+             logger.trace(f"crud: setting quote {quote_id} as {state.value}")
+             await self.crud.update_mint_quote(quote=quote, db=self.db, conn=conn)
+         if quote is None:
+@@ -339,7 +399,10 @@ class DbWriteHelper:
+         return quote
+ 
+     async def _unset_mint_quotes_pending(
+-        self, quote_ids: List[str], state: MintQuoteState
++        self,
++        quote_ids: List[str],
++        state: MintQuoteState,
++        issued_amounts: Optional[List[int]] = None,
+     ) -> List[MintQuote]:
+         """Unsets multiple mint quotes as pending.
+ 
+@@ -367,7 +430,11 @@ class DbWriteHelper:
+                 )
+             ],
+         ) as conn:
+-            for quote_id in quote_ids:
++            if issued_amounts is not None and len(issued_amounts) != len(quote_ids):
++                raise TransactionError(
++                    "issued amounts length must match quote ids length"
++                )
++            for i, quote_id in enumerate(quote_ids):
+                 quote = await self.crud.get_mint_quote(
+                     quote_id=quote_id, db=self.db, conn=conn
+                 )
+@@ -377,8 +444,10 @@ class DbWriteHelper:
+                     raise TransactionError(
+                         f"Mint quote {quote_id} not pending: {quote.state.value}. Cannot set as {state.value}."
+                     )
+-                # set the quote to previous state
+-                self._set_mint_quote_state(quote, state)
++                if state == MintQuoteState.issued and issued_amounts is not None:
++                    self._apply_mint_quote_issuance(quote, issued_amounts[i])
++                else:
++                    self._restore_mint_quote_state(quote, state)
+                 logger.trace(f"crud: setting quote {quote_id} as {state.value}")
+                 await self.crud.update_mint_quote(quote=quote, db=self.db, conn=conn)
+                 quotes.append(quote)
+diff --git a/cashu/mint/events/event_model.py b/cashu/mint/events/event_model.py
+index a6220b4a..2319bd51 100644
+--- a/cashu/mint/events/event_model.py
++++ b/cashu/mint/events/event_model.py
+@@ -17,5 +17,5 @@ class LedgerEvent(ABC, BaseModel):
+ 
+     @property
+     @abstractmethod
+-    def kind(self) -> JSONRPCSubscriptionKinds:
++    def kind(self) -> JSONRPCSubscriptionKinds | str:
+         pass
+diff --git a/cashu/mint/events/events.py b/cashu/mint/events/events.py
+index 61649263..d4980e74 100644
+--- a/cashu/mint/events/events.py
++++ b/cashu/mint/events/events.py
+@@ -62,6 +62,10 @@ class LedgerEventManager:
+ 
+         # check if any clients are subscribed to this event
+         for client in self.clients:
++            # NUT-17 only defines subscription kinds for standardized methods.
++            # A plugin-specific event is therefore not published over websocket.
++            if isinstance(event.kind, str):
++                continue
+             kind_sub = client.subscriptions.get(event.kind, {})
+             for sub in kind_sub.get(event.identifier, []):
+                 logger.trace(
+diff --git a/cashu/mint/features.py b/cashu/mint/features.py
+index 7bba02b9..c1f52226 100644
+--- a/cashu/mint/features.py
++++ b/cashu/mint/features.py
+@@ -30,6 +30,7 @@ from ..core.nuts.nuts import (
+ )
+ from ..core.settings import settings
+ from ..mint.protocols import SupportsBackends, SupportsPubkey
++from ..payment import payment_method_registry
+ 
+ _VERSION_PREFIX = "Nutshell"
+ _SUPPORTED = "supported"
+@@ -81,26 +82,55 @@ class LedgerFeatures(SupportsBackends, SupportsPubkey):
+         mint_method_settings: List[MintMethodSetting] = []
+         for method, unit_dict in self.backends.items():
+             for unit in unit_dict.keys():
++                method_name = method.name if isinstance(method, Method) else method
++                plugin = payment_method_registry.get(method_name)
++                plugin_settings = plugin.settings_for(unit_dict[unit], unit)
+                 mint_setting = MintMethodSetting(
+-                    method=method.name, unit=unit.name, method_name=method.name
++                    method=method_name,
++                    unit=unit.name,
++                    method_name=plugin_settings.method_name,
+                 )
+-                if settings.mint_max_mint_bolt11_sat:
++                if method_name == Method.bolt11.name:
++                    mint_setting.options = MintMethodBolt11OptionSetting(
++                        description=plugin.supports_description(unit_dict[unit])
++                    )
++                else:
++                    mint_setting.options = plugin_settings.options
++                if (
++                    method_name == Method.bolt11.name
++                    and settings.mint_max_mint_bolt11_sat
++                ):
+                     mint_setting.max_amount = settings.mint_max_mint_bolt11_sat
+                     mint_setting.min_amount = 0
+-                mint_setting.options = MintMethodBolt11OptionSetting(
+-                    description=unit_dict[unit].supports_description
+-                )
+-                mint_method_settings.append(mint_setting)
++                else:
++                    mint_setting.min_amount = plugin_settings.min_amount
++                    mint_setting.max_amount = plugin_settings.max_amount
++                if plugin_settings.mint_enabled:
++                    mint_method_settings.append(mint_setting)
+         melt_method_settings: List[MeltMethodSetting] = []
+         for method, unit_dict in self.backends.items():
+             for unit in unit_dict.keys():
++                method_name = method.name if isinstance(method, Method) else method
++                plugin_settings = payment_method_registry.get(method_name).settings_for(
++                    unit_dict[unit], unit
++                )
+                 melt_setting = MeltMethodSetting(
+-                    method=method.name, unit=unit.name, method_name=method.name
++                    method=method_name,
++                    unit=unit.name,
++                    method_name=plugin_settings.method_name,
+                 )
+-                if settings.mint_max_melt_bolt11_sat:
++                if (
++                    method_name == Method.bolt11.name
++                    and settings.mint_max_melt_bolt11_sat
++                ):
+                     melt_setting.max_amount = settings.mint_max_melt_bolt11_sat
+                     melt_setting.min_amount = 0
+-                melt_method_settings.append(melt_setting)
++                else:
++                    melt_setting.min_amount = plugin_settings.min_amount
++                    melt_setting.max_amount = plugin_settings.max_amount
++                melt_setting.options = plugin_settings.options
++                if plugin_settings.melt_enabled:
++                    melt_method_settings.append(melt_setting)
+ 
+         mint_features: Dict[int, Union[List[Any], Dict[str, Any]]] = {
+             MINT_NUT: dict(
+@@ -134,7 +164,9 @@ class LedgerFeatures(SupportsBackends, SupportsPubkey):
+         mint_features[BATCH_MINT_NUT] = {
+             "supported": True,
+             "max_batch_size": settings.mint_max_request_length,
+-            "methods": list(set([m.name for m in self.backends.keys()])),
++            "methods": list(
++                set([m.name if isinstance(m, Method) else m for m in self.backends])
++            ),
+         }
+         return mint_features
+ 
+@@ -145,8 +177,10 @@ class LedgerFeatures(SupportsBackends, SupportsPubkey):
+         mpp_features = []
+         for method, unit_dict in self.backends.items():
+             for unit in unit_dict.keys():
+-                if unit_dict[unit].supports_mpp:
+-                    mpp_features.append({"method": method.name, "unit": unit.name})
++                method_name = method.name if isinstance(method, Method) else method
++                plugin = payment_method_registry.get(method_name)
++                if plugin.supports_mpp(unit_dict[unit]):
++                    mpp_features.append({"method": method_name, "unit": unit.name})
+ 
+         if mpp_features:
+             mint_features[MPP_NUT] = dict(methods=mpp_features)
+diff --git a/cashu/mint/ledger.py b/cashu/mint/ledger.py
+index 15e96e6a..28acba5c 100644
+--- a/cashu/mint/ledger.py
++++ b/cashu/mint/ledger.py
+@@ -1,7 +1,7 @@
+ import asyncio
+ import time
+ import traceback
+-from typing import Dict, List, Mapping, Optional, Tuple
++from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+ 
+ import bolt11
+ from loguru import logger
+@@ -60,8 +60,6 @@ from ..core.models import (
+ from ..core.settings import settings
+ from ..core.split import amount_split
+ from ..lightning.base import (
+-    InvoiceResponse,
+-    LightningBackend,
+     PaymentQuoteResponse,
+     PaymentResponse,
+     PaymentResult,
+@@ -70,6 +68,7 @@ from ..lightning.base import (
+     StatusResponse,
+ )
+ from ..mint.crud import LedgerCrudSqlite
++from ..payment import payment_method_registry
+ from .conditions import LedgerSpendingConditions
+ from .db.lease import maintain_melt_lease
+ from .db.read import DbReadHelper
+@@ -90,7 +89,7 @@ class Ledger(
+     LedgerWatchdog,
+     LedgerKeysets,
+ ):
+-    backends: Mapping[Method, Mapping[Unit, LightningBackend]] = {}
++    backends: Mapping[Union[Method, str], Mapping[Unit, Any]] = {}
+     keysets: Dict[str, MintKeyset] = {}
+     events = LedgerEventManager()
+     db: Database
+@@ -108,12 +107,12 @@ class Ledger(
+         seed: Optional[str],
+         derivation_path="",
+         amounts: Optional[List[int]] = None,
+-        backends: Optional[Mapping[Method, Mapping[Unit, LightningBackend]]] = None,
++        backends: Optional[Mapping[Union[Method, str], Mapping[Unit, Any]]] = None,
+         seed_decryption_key: Optional[str] = None,
+         crud=LedgerCrudSqlite(),
+     ) -> None:
+         self.keysets: Dict[str, MintKeyset] = {}
+-        self.backends: Mapping[Method, Mapping[Unit, LightningBackend]] = {}
++        self.backends: Mapping[Union[Method, str], Mapping[Unit, Any]] = {}
+         self.events = LedgerEventManager()
+         self.db_read: DbReadHelper
+         self.locks: Dict[str, asyncio.Lock] = {}  # holds multiprocessing locks
+@@ -168,9 +167,10 @@ class Ledger(
+     async def startup_ledger(self) -> None:
+         # A starting worker must respect other workers' live execution leases.
+         await self._startup_keysets()
+-        for unitbackends in self.backends.values():
++        for method, unitbackends in self.backends.items():
++            plugin = payment_method_registry.get(self._method_name(method))
+             for backend in unitbackends.values():
+-                await backend.startup()
++                await plugin.startup(backend)
+         await self._check_backends()
+         self.regular_tasks.append(asyncio.create_task(self._run_regular_tasks()))
+         self.invoice_listener_tasks = await self.dispatch_listeners()
+@@ -203,12 +203,14 @@ class Ledger(
+     async def _check_backends(self) -> None:
+         for method in self.backends:
+             for unit in self.backends[method]:
++                method_name = self._method_name(method)
++                plugin = payment_method_registry.get(method_name)
+                 logger.info(
+                     f"Using {self.backends[method][unit].__class__.__name__} backend for"
+-                    f" method: '{method.name}' and unit: '{unit.name}'"
++                    f" method: '{method_name}' and unit: '{unit.name}'"
+                 )
+                 try:
+-                    status = await self.backends[method][unit].status()
++                    status = await plugin.status(self.backends[method][unit])
+                 except Exception as e:
+                     logger.debug(
+                         f"Backend status check failed: {traceback.format_exc()}"
+@@ -252,10 +254,11 @@ class Ledger(
+             await self.events.cleanup()
+ 
+             logger.debug("Shutting down backends")
+-            for unitbackends in self.backends.values():
++            for method, unitbackends in self.backends.items():
++                plugin = payment_method_registry.get(self._method_name(method))
+                 for backend in unitbackends.values():
+                     try:
+-                        await backend.cleanup()
++                        await plugin.cleanup(backend)
+                     except Exception as exc:
+                         logger.warning(
+                             f"Error cleaning up {type(backend).__name__}: {exc}"
+@@ -639,7 +642,11 @@ class Ledger(
+ 
+     # ------- TRANSACTIONS -------
+ 
+-    async def mint_quote(self, quote_request: PostMintQuoteRequest) -> MintQuote:
++    async def mint_quote(
++        self,
++        quote_request: PostMintQuoteRequest,
++        method_str: str = Method.bolt11.name,
++    ) -> MintQuote:
+         """Creates a mint quote and stores it in the database.
+ 
+         Args:
+@@ -655,23 +662,22 @@ class Ledger(
+         if not quote_request.amount > 0:
+             raise TransactionError("amount must be positive")
+         if (
+-            settings.mint_max_mint_bolt11_sat
++            method_str == Method.bolt11.name
++            and settings.mint_max_mint_bolt11_sat
+             and quote_request.amount > settings.mint_max_mint_bolt11_sat
+         ):
+             raise TransactionAmountExceedsLimitError(
+                 f"Maximum mint amount is {settings.mint_max_mint_bolt11_sat} sat."
+             )
+-        if settings.mint_bolt11_disable_mint:
++        if method_str == Method.bolt11.name and settings.mint_bolt11_disable_mint:
+             raise MintingDisabledError("Minting with bolt11 is disabled.")
+ 
+-        unit, method = self._verify_and_get_unit_method(
+-            quote_request.unit, Method.bolt11.name
+-        )
++        unit, method = self._verify_and_get_unit_method(quote_request.unit, method_str)
++        method_name = self._method_name(method)
++        plugin = payment_method_registry.get(method_name)
++        backend = self._get_backend(method, unit)
+ 
+-        if (
+-            quote_request.description
+-            and not self.backends[method][unit].supports_description
+-        ):
++        if quote_request.description and not plugin.supports_description(backend):
+             raise NotAllowedError("Backend does not support descriptions.")
+ 
+         # Check maximum balance.
+@@ -682,25 +688,21 @@ class Ledger(
+                 raise NotAllowedError("Mint has reached maximum balance.")
+ 
+         logger.trace(f"requesting invoice for {unit.str(quote_request.amount)}")
+-        invoice_response: InvoiceResponse = await self.backends[method][
+-            unit
+-        ].create_invoice(
+-            amount=Amount(unit=unit, amount=quote_request.amount),
+-            memo=quote_request.description,
+-        )
++        invoice_response = await plugin.create_incoming_payment(backend, quote_request)
+         logger.trace(
+             f"got invoice {invoice_response.payment_request} with checking id"
+             f" {invoice_response.checking_id}"
+         )
+ 
+         if not (invoice_response.payment_request and invoice_response.checking_id):
+-            raise LightningError("could not fetch bolt11 payment request from backend")
++            raise LightningError("could not fetch payment request from backend")
+ 
+         quote_amount = invoice_response.amount or Amount(unit, quote_request.amount)
+         if quote_amount.unit != unit or quote_amount.amount <= 0:
+             raise LightningError("backend returned an invalid mint quote amount")
+         if (
+-            settings.mint_max_mint_bolt11_sat
++            method_name == Method.bolt11.name
++            and settings.mint_max_mint_bolt11_sat
+             and quote_amount.amount > settings.mint_max_mint_bolt11_sat
+         ):
+             raise TransactionAmountExceedsLimitError(
+@@ -712,24 +714,23 @@ class Ledger(
+         ):
+             raise NotAllowedError("Mint has reached maximum balance.")
+ 
+-        # get invoice expiry time
+-        invoice_obj = bolt11.decode(invoice_response.payment_request)
+-        self._verify_mint_quote_invoice_amount(invoice_obj, quote_amount)
++        if method_name == Method.bolt11.name:
++            self._verify_mint_quote_invoice_amount(
++                bolt11.decode(invoice_response.payment_request), quote_amount
++            )
+ 
+-        # NOTE: we normalize the request to lowercase to avoid case sensitivity
+-        # This works with Lightning but might not work with other methods
+-        request = invoice_response.payment_request.lower()
++        request = plugin.canonicalize_request(invoice_response.payment_request)
+ 
+         now = int(time.time())
+         expiry = None
+         if settings.mint_quote_ttl is not None:
+             expiry = now + settings.mint_quote_ttl
+-        elif invoice_obj.expiry is not None:
+-            expiry = invoice_obj.date + invoice_obj.expiry
++        else:
++            expiry = plugin.quote_expiry(invoice_response.payment_request)
+ 
+         quote = MintQuote(
+             quote=generate_uuid_v7(),
+-            method=method.name,
++            method=method_name,
+             request=request,
+             checking_id=invoice_response.checking_id,
+             unit=quote_request.unit,
+@@ -738,13 +739,16 @@ class Ledger(
+             created_time=now,
+             expiry=expiry,
+             pubkey=quote_request.pubkey,
++            method_data=invoice_response.model_extra or {},
+         )
+         await self.crud.store_mint_quote(quote=quote, db=self.db)
+         await self.events.submit(quote)
+ 
+         return quote
+ 
+-    async def get_mint_quote(self, quote_id: str) -> MintQuote:
++    async def get_mint_quote(
++        self, quote_id: str, *, force_backend_check: bool = False
++    ) -> MintQuote:
+         """Returns a mint quote. If the quote is not paid, checks with the backend if the associated request is paid.
+ 
+         Args:
+@@ -762,16 +766,19 @@ class Ledger(
+ 
+         unit, method = self._verify_and_get_unit_method(quote.unit, quote.method)
+ 
+-        if quote.unpaid:
++        plugin = payment_method_registry.get(quote.method)
++        if not quote.pending and (quote.unpaid or plugin.allows_partial_mint):
+             if not quote.checking_id:
+                 raise CashuError("quote has no checking id")
+ 
+             now = int(time.time())
+-            updated = await self.crud.try_update_mint_quote_last_checked(
+-                quote_id=quote_id,
+-                last_checked=now,
+-                rate_limit=settings.mint_quote_backend_check_rate_limit,
+-                db=self.db,
++            updated = force_backend_check or (
++                await self.crud.try_update_mint_quote_last_checked(
++                    quote_id=quote_id,
++                    last_checked=now,
++                    rate_limit=settings.mint_quote_backend_check_rate_limit,
++                    db=self.db,
++                )
+             )
+             if not updated:
+                 logger.trace(
+@@ -781,10 +788,15 @@ class Ledger(
+             quote.last_checked = now
+ 
+             logger.trace(f"Lightning: checking invoice {quote.checking_id}")
+-            status: PaymentStatus = await self.backends[method][
+-                unit
+-            ].get_invoice_status(quote.checking_id)
+-            if status.settled:
++            status = await plugin.get_incoming_payment_status(
++                self._get_backend(method, unit), quote
++            )
++            reported_paid = (
++                status.amount_paid.to(unit).amount if status.amount_paid else None
++            )
++            if status.settled and reported_paid is None:
++                reported_paid = quote.amount
++            if reported_paid is not None and reported_paid > (quote.amount_paid or 0):
+                 # change state to paid in one transaction, it could have been marked paid
+                 # by the invoice listener in the mean time
+                 async with self.db.get_connection(
+@@ -801,10 +813,15 @@ class Ledger(
+                     )
+                     if not quote:
+                         raise Exception("quote not found")
+-                    if quote.unpaid:
++                    if reported_paid > (quote.amount_paid or 0):
+                         logger.trace(f"Setting quote {quote_id} as paid")
+-                        quote.state = MintQuoteState.paid
+-                        quote.paid_time = now
++                        quote.amount_paid = reported_paid
++                        quote.state_val = (
++                            MintQuoteState.issued
++                            if reported_paid == (quote.amount_issued or 0)
++                            else MintQuoteState.paid
++                        )
++                        quote.paid_time = quote.paid_time or now
+                         quote.last_checked = now
+                         quote.updated_at = now
+                         await self.crud.update_mint_quote(
+@@ -839,6 +856,7 @@ class Ledger(
+         outputs: List[BlindedMessage],
+         quote_id: str,
+         signature: Optional[str] = None,
++        method_str: Optional[str] = None,
+     ) -> List[BlindedSignature]:
+         """Mints new coins if quote with `quote_id` was paid. Ingest blind messages `outputs` and returns blind signatures `promises`.
+ 
+@@ -863,24 +881,32 @@ class Ledger(
+         output_unit = self.keysets[outputs[0].id].unit
+ 
+         quote = await self.get_mint_quote(quote_id)
++        if method_str is not None and quote.method != method_str:
++            raise NotAllowedError("quote payment method does not match endpoint")
+         if quote.pending:
+             raise QuotePendingError("Mint quote already pending.")
+         if quote.issued:
+             raise QuoteAlreadyIssuedError()
+         if quote.state != MintQuoteState.paid:
+             raise QuoteNotPaidError()
++        plugin = payment_method_registry.get(quote.method)
+ 
+         # Also validate quotes created before invoice amount checks were added.
+-        self._verify_mint_quote_invoice_amount(
+-            bolt11.decode(quote.request), Amount(Unit[quote.unit], quote.amount)
+-        )
++        if quote.method == Method.bolt11.name:
++            self._verify_mint_quote_invoice_amount(
++                bolt11.decode(quote.request), Amount(Unit[quote.unit], quote.amount)
++            )
+ 
+         previous_state = quote.state
+-        await self.db_write._set_mint_quote_pending(quote_id=quote_id)
++        quote = await self.db_write._set_mint_quote_pending(quote_id=quote_id)
+         try:
+             if not quote.unit == output_unit.name:
+                 raise TransactionError("quote unit does not match output unit")
+-            if not quote.amount == sum_amount_outputs:
++            available = (quote.amount_paid or 0) - (quote.amount_issued or 0)
++            if plugin.allows_partial_mint:
++                if sum_amount_outputs > available:
++                    raise TransactionError("amount to mint exceeds paid quote balance")
++            elif not quote.amount == sum_amount_outputs:
+                 raise TransactionError("amount to mint does not match quote amount")
+             if quote.expiry and quote.expiry < int(time.time()):
+                 raise QuoteExpiredError("quote expired")
+@@ -894,7 +920,9 @@ class Ledger(
+             )
+             raise e
+         await self.db_write._unset_mint_quote_pending(
+-            quote_id=quote_id, state=MintQuoteState.issued
++            quote_id=quote_id,
++            state=MintQuoteState.issued,
++            issued_amount=sum_amount_outputs,
+         )
+ 
+         return promises
+@@ -902,6 +930,7 @@ class Ledger(
+     async def mint_batch(
+         self,
+         payload: PostMintBatchRequest,
++        method_str: Optional[str] = None,
+     ) -> List[BlindedSignature]:
+         """Batch mint tokens.
+ 
+@@ -937,13 +966,15 @@ class Ledger(
+             if not quote:
+                 raise TransactionError(f"quote {quote_id} not found")
+             quotes.append(quote)
++        if method_str is not None and any(q.method != method_str for q in quotes):
++            raise NotAllowedError("quote payment method does not match endpoint")
+ 
+         # Check payment method consistency
+         methods = set([q.method for q in quotes])
+         if len(methods) > 1:
+             raise TransactionError("all quotes must have the same method")
+-        if Method.bolt11.name not in methods:
+-            raise TransactionError("all quotes must be of bolt11 method")
++        batch_method = next(iter(methods))
++        plugin = payment_method_registry.get(batch_method)
+ 
+         # Check currency unit consistency
+         units = set([q.unit for q in quotes])
+@@ -959,9 +990,10 @@ class Ledger(
+                 raise QuoteAlreadyIssuedError()
+             if quote.state != MintQuoteState.paid:
+                 raise QuoteNotPaidError()
+-            self._verify_mint_quote_invoice_amount(
+-                bolt11.decode(quote.request), Amount(Unit[quote.unit], quote.amount)
+-            )
++            if quote.method == Method.bolt11.name:
++                self._verify_mint_quote_invoice_amount(
++                    bolt11.decode(quote.request), Amount(Unit[quote.unit], quote.amount)
++                )
+ 
+         # Check amount balance
+         if payload.quote_amounts:
+@@ -969,26 +1001,35 @@ class Ledger(
+                 raise TransactionError("quote_amounts length must match quotes length")
+             for i, quote in enumerate(quotes):
+                 if (
+-                    quote.method == Method.bolt11.name
++                    not plugin.allows_partial_mint
+                     and payload.quote_amounts[i] != quote.amount
+                 ):
+                     raise TransactionError(
+                         f"quote amount {payload.quote_amounts[i]} does not match quote {quote.quote} amount {quote.amount}"
+                     )
+-                if payload.quote_amounts[i] > quote.amount:
++                available = (quote.amount_paid or 0) - (quote.amount_issued or 0)
++                if plugin.allows_partial_mint and payload.quote_amounts[i] > available:
+                     raise TransactionError(
+-                        f"quote amount {payload.quote_amounts[i]} exceeds quote {quote.quote} amount {quote.amount}"
++                        f"quote amount {payload.quote_amounts[i]} exceeds quote {quote.quote} paid balance"
+                     )
+ 
+-        quote_amounts = payload.quote_amounts or [q.amount for q in quotes]
+-        if Method.bolt11.name in methods:
++        quote_amounts = payload.quote_amounts or (
++            [(q.amount_paid or 0) - (q.amount_issued or 0) for q in quotes]
++            if plugin.allows_partial_mint
++            else [q.amount for q in quotes]
++        )
++        if any(amount <= 0 for amount in quote_amounts):
++            raise TransactionError("quote amounts must be positive")
++        if not plugin.allows_partial_mint:
+             if sum(quote_amounts) != sum_amount_outputs:
+                 raise TransactionError(
+                     "amount to mint does not match quote amounts sum"
+                 )
+         else:
+-            if sum_amount_outputs > sum(quote_amounts):
+-                raise TransactionError("amount to mint exceeds quote amounts sum")
++            if sum_amount_outputs != sum(quote_amounts):
++                raise TransactionError(
++                    "amount to mint does not match quote amounts sum"
++                )
+ 
+         # Signature validation (NUT-20)
+         for i, quote in enumerate(quotes):
+@@ -1006,9 +1047,14 @@ class Ledger(
+         quotes = await self.db_write._set_mint_quotes_pending(quote_ids=payload.quotes)
+ 
+         try:
+-            for quote in quotes:
++            for i, quote in enumerate(quotes):
+                 if quote.expiry and quote.expiry < int(time.time()):
+                     raise QuoteExpiredError("quote expired")
++                available = (quote.amount_paid or 0) - (quote.amount_issued or 0)
++                if quote_amounts[i] > available:
++                    raise TransactionError(
++                        f"quote amount {quote_amounts[i]} exceeds quote {quote.quote} paid balance"
++                    )
+ 
+             # Store all blinded messages
+             await self._store_blinded_messages(
+@@ -1025,26 +1071,29 @@ class Ledger(
+ 
+         # Set all quotes to issued
+         await self.db_write._unset_mint_quotes_pending(
+-            quote_ids=payload.quotes, state=MintQuoteState.issued
++            quote_ids=payload.quotes,
++            state=MintQuoteState.issued,
++            issued_amounts=quote_amounts,
+         )
+ 
+         return promises
+ 
+     def create_internal_melt_quote(
+-        self, mint_quote: MintQuote, melt_quote: PostMeltQuoteRequest
++        self,
++        mint_quote: MintQuote,
++        melt_quote: PostMeltQuoteRequest,
++        method_str: str = Method.bolt11.name,
+     ) -> PaymentQuoteResponse:
+-        unit, method = self._verify_and_get_unit_method(
+-            melt_quote.unit, Method.bolt11.name
+-        )
+-        # NOTE: we normalize the request to lowercase to avoid case sensitivity
+-        # This works with Lightning but might not work with other methods
+-        request = melt_quote.request.lower()
++        unit, method = self._verify_and_get_unit_method(melt_quote.unit, method_str)
++        method_name = self._method_name(method)
++        plugin = payment_method_registry.get(method_name)
++        request = plugin.canonicalize_request(melt_quote.request)
+ 
+         if not request == mint_quote.request:
+-            raise TransactionError("bolt11 requests do not match")
++            raise TransactionError("payment requests do not match")
+         if not mint_quote.unit == melt_quote.unit:
+             raise TransactionError("units do not match")
+-        if not mint_quote.method == method.name:
++        if not mint_quote.method == method_name:
+             raise TransactionError("methods do not match")
+         if mint_quote.paid:
+             raise InvoiceAlreadyPaidError("mint quote already paid")
+@@ -1074,12 +1123,13 @@ class Ledger(
+         return payment_quote
+ 
+     def validate_payment_quote(
+-        self, melt_quote: PostMeltQuoteRequest, payment_quote: PaymentQuoteResponse
++        self,
++        melt_quote: PostMeltQuoteRequest,
++        payment_quote: PaymentQuoteResponse,
++        method_str: str = Method.bolt11.name,
+     ):
+         # payment quote validation
+-        unit, method = self._verify_and_get_unit_method(
+-            melt_quote.unit, Method.bolt11.name
+-        )
++        unit, method = self._verify_and_get_unit_method(melt_quote.unit, method_str)
+         if not payment_quote.checking_id:
+             raise Exception("quote has no checking id")
+         # verify that payment quote amount is as expected
+@@ -1099,7 +1149,9 @@ class Ledger(
+             raise TransactionError("payment quote fee units do not match")
+ 
+     async def melt_quote(
+-        self, melt_quote: PostMeltQuoteRequest
++        self,
++        melt_quote: PostMeltQuoteRequest,
++        method_str: str = Method.bolt11.name,
+     ) -> PostMeltQuoteResponse:
+         """Creates a melt quote and stores it in the database.
+ 
+@@ -1114,44 +1166,50 @@ class Ledger(
+         Returns:
+             PostMeltQuoteResponse: Melt quote response.
+         """
+-        if settings.mint_bolt11_disable_melt:
++        if method_str == Method.bolt11.name and settings.mint_bolt11_disable_melt:
+             raise NotAllowedError("Melting with bol11 is disabled.")
+ 
+-        unit, method = self._verify_and_get_unit_method(
+-            melt_quote.unit, Method.bolt11.name
+-        )
++        unit, method = self._verify_and_get_unit_method(melt_quote.unit, method_str)
++        method_name = self._method_name(method)
++        plugin = payment_method_registry.get(method_name)
++        backend = self._get_backend(method, unit)
+ 
+-        # NOTE: we normalize the request to lowercase to avoid case sensitivity
+-        # This works with Lightning but might not work with other methods
+-        request = melt_quote.request.lower()
++        request = plugin.canonicalize_request(melt_quote.request)
+ 
+-        expiry = self.backends[method][unit].validate_payment_request(request)
++        expiry = plugin.validate_payment_request(backend, request)
+ 
+         # check if there is a mint quote with the same payment request
+         # so that we would be able to handle the transaction internally
+         # and therefore respond with internal transaction fees (0 for now)
+         mint_quote = await self.crud.get_mint_quote(request=request, db=self.db)
+-        if mint_quote and mint_quote.unit == melt_quote.unit:
++        if (
++            mint_quote
++            and mint_quote.unit == melt_quote.unit
++            and mint_quote.method == method_name
++        ):
+             # check if the melt quote is partial and error if it is.
+             # it's just not possible to handle this case
+             if melt_quote.is_mpp:
+                 raise TransactionError("internal mpp not allowed.")
+-            payment_quote = self.create_internal_melt_quote(mint_quote, melt_quote)
++            payment_quote = self.create_internal_melt_quote(
++                mint_quote, melt_quote, method_name
++            )
+         else:
+             # not internal
+             # verify that the backend supports mpp if the quote request has an amount
+-            if melt_quote.is_mpp and not self.backends[method][unit].supports_mpp:
++            if melt_quote.is_mpp and not plugin.supports_mpp(
++                self.backends[method][unit]
++            ):
+                 raise TransactionError("backend does not support mpp.")
+             # get payment quote by backend
+-            payment_quote = await self.backends[method][unit].get_payment_quote(
+-                melt_quote=melt_quote
+-            )
++            payment_quote = await plugin.quote_outgoing_payment(backend, melt_quote)
+ 
+-        self.validate_payment_quote(melt_quote, payment_quote)
++        self.validate_payment_quote(melt_quote, payment_quote, method_name)
+ 
+         # verify that the amount of the proofs is not larger than the maximum allowed
+         if (
+-            settings.mint_max_melt_bolt11_sat
++            method_name == Method.bolt11.name
++            and settings.mint_max_melt_bolt11_sat
+             and payment_quote.amount.to(unit).amount > settings.mint_max_melt_bolt11_sat
+         ):
+             raise NotAllowedError(
+@@ -1166,7 +1224,7 @@ class Ledger(
+ 
+         quote = MeltQuote(
+             quote=generate_uuid_v7(),
+-            method=method.name,
++            method=method_name,
+             request=request,
+             checking_id=payment_quote.checking_id,
+             unit=unit.name,
+@@ -1175,20 +1233,12 @@ class Ledger(
+             fee_reserve=payment_quote.fee.to(unit).amount,
+             created_time=now,
+             expiry=expiry,
++            method_data=payment_quote.model_extra or {},
+         )
+         await self.db_write._store_melt_quote(quote)
+         await self.events.submit(quote)
+ 
+-        return PostMeltQuoteResponse(
+-            quote=quote.quote,
+-            amount=quote.amount,
+-            unit=quote.unit,
+-            method=quote.method,
+-            request=quote.request,
+-            fee_reserve=quote.fee_reserve,
+-            state=quote.state.value,
+-            expiry=quote.expiry,
+-        )
++        return PostMeltQuoteResponse.from_melt_quote(quote)
+ 
+     async def _resolve_melt_payment_status(
+         self, melt_quote: MeltQuote, lock_token: Optional[str] = None
+@@ -1197,8 +1247,11 @@ class Ledger(
+             melt_quote.unit, melt_quote.method
+         )
+         try:
++            plugin = payment_method_registry.get(melt_quote.method)
+             status = await asyncio.wait_for(
+-                self.backends[method][unit].get_payment_status(melt_quote.checking_id),
++                plugin.get_outgoing_payment_status(
++                    self._get_backend(method, unit), melt_quote
++                ),
+                 timeout=min(10, settings.mint_melt_lease_seconds / 2),
+             )
+         except Exception as e:
+@@ -1397,10 +1450,13 @@ class Ledger(
+ 
+             if mint_quote.amount != melt_quote.amount:
+                 raise AmountMismatchError("amounts do not match")
+-            if melt_quote.request != mint_quote.request:
+-                raise TransactionError("bolt11 requests do not match")
+             if mint_quote.method != melt_quote.method:
+                 raise TransactionError("methods do not match")
++            plugin = payment_method_registry.get(melt_quote.method)
++            try:
++                plugin.validate_internal_settlement(mint_quote, melt_quote)
++            except ValueError as exc:
++                raise TransactionError(str(exc)) from exc
+ 
+             if mint_quote.paid:
+                 raise InvoiceAlreadyPaidError("mint quote already paid")
+@@ -1410,7 +1466,7 @@ class Ledger(
+                 raise TransactionError("mint quote is not unpaid")
+ 
+             logger.info(
+-                f"Settling bolt11 payment internally: {melt_quote.quote} ->"
++                f"Settling {melt_quote.method} payment internally: {melt_quote.quote} ->"
+                 f" {mint_quote.quote} ({melt_quote.amount} {melt_quote.unit})"
+             )
+ 
+@@ -1445,6 +1501,7 @@ class Ledger(
+         proofs: List[Proof],
+         quote: str,
+         outputs: Optional[List[BlindedMessage]] = None,
++        method_str: Optional[str] = None,
+     ) -> PostMeltQuoteResponse:
+         """Invalidates proofs and pays a Lightning invoice asynchronously.
+ 
+@@ -1460,7 +1517,10 @@ class Ledger(
+             PostMeltQuoteResponse: Melt quote response after PENDING is committed.
+         """
+         melt_quote = await self._prepare_melt(
+-            proofs=proofs, quote=quote, outputs=outputs
++            proofs=proofs,
++            quote=quote,
++            outputs=outputs,
++            method_str=method_str,
+         )
+ 
+         async def melt_task():
+@@ -1480,6 +1540,7 @@ class Ledger(
+         proofs: List[Proof],
+         quote: str,
+         outputs: Optional[List[BlindedMessage]] = None,
++        method_str: Optional[str] = None,
+     ) -> PostMeltQuoteResponse:
+         """Invalidates proofs and pays a Lightning invoice.
+ 
+@@ -1495,7 +1556,10 @@ class Ledger(
+             PostMeltQuoteResponse: Melt quote response.
+         """
+         melt_quote = await self._prepare_melt(
+-            proofs=proofs, quote=quote, outputs=outputs
++            proofs=proofs,
++            quote=quote,
++            outputs=outputs,
++            method_str=method_str,
+         )
+         return await self._execute_melt_payment(melt_quote, proofs, outputs)
+ 
+@@ -1505,6 +1569,7 @@ class Ledger(
+         proofs: List[Proof],
+         quote: str,
+         outputs: Optional[List[BlindedMessage]] = None,
++        method_str: Optional[str] = None,
+     ) -> MeltQuote:
+         """Validates a melt request and durably sets the quote and proofs to pending."""
+         # make sure we're allowed to melt
+@@ -1513,6 +1578,8 @@ class Ledger(
+ 
+         # get melt quote and check if it was already paid
+         melt_quote = await self.get_melt_quote(quote_id=quote)
++        if method_str is not None and melt_quote.method != method_str:
++            raise NotAllowedError("quote payment method does not match endpoint")
+         if melt_quote.paid:
+             raise InvoiceAlreadyPaidError(
+                 f"melt quote is not unpaid: {melt_quote.state}"
+@@ -1576,7 +1643,9 @@ class Ledger(
+                 proofs=proofs,
+                 keysets=self.keysets,
+                 conn=conn,
+-                get_checking_id=self.backends[method][unit].get_payment_checking_id,
++                get_checking_id=lambda quote: payment_method_registry.get(
++                    quote.method
++                ).get_payment_checking_id(self._get_backend(method, unit), quote),
+             )
+ 
+         return melt_quote
+@@ -1655,13 +1724,11 @@ class Ledger(
+         # quote not paid yet (not internal), pay it with the backend
+         logger.debug(f"Lightning: pay invoice {melt_quote.request}")
+         try:
+-            fee_limit_msat = (
+-                Amount(Unit[melt_quote.unit], melt_quote.fee_reserve)
+-                .to(Unit.msat)
+-                .amount
+-            )
+-            payment = await self.backends[method][unit].pay_invoice(
+-                melt_quote, fee_limit_msat
++            plugin = payment_method_registry.get(melt_quote.method)
++            payment = await plugin.execute_outgoing_payment(
++                self._get_backend(method, unit),
++                melt_quote,
++                Amount(Unit[melt_quote.unit], melt_quote.fee_reserve),
+             )
+             logger.debug(
+                 f"Melt – Result: {payment.result.name}: preimage: {payment.preimage},"
+diff --git a/cashu/mint/management_rpc/management_rpc.py b/cashu/mint/management_rpc/management_rpc.py
+index 55025471..89912c3b 100644
+--- a/cashu/mint/management_rpc/management_rpc.py
++++ b/cashu/mint/management_rpc/management_rpc.py
+@@ -146,6 +146,7 @@ class MintManagementRPC(management_pb2_grpc.MintServicer):
+         logger.debug("gRPC GetNut04Quote has been called")
+         mint_quote = await self.ledger.get_mint_quote(request.quote_id)
+         mint_quote_dict = mint_quote.model_dump()
++        mint_quote_dict.pop("method_data", None)
+         mint_quote_dict['state'] = str(mint_quote.state)
+         mint_quote_dict.pop('state_val', None)
+         del mint_quote_dict['mint'] # unused
+@@ -168,7 +169,13 @@ class MintManagementRPC(management_pb2_grpc.MintServicer):
+         logger.debug("gRPC GetNut05Quote has been called")
+         melt_quote = await self.ledger.get_melt_quote(request.quote_id)
+         melt_quote_dict = melt_quote.model_dump(
+-            exclude={"attempt", "melt_lock", "melt_lock_expires_at", "payment_uncertain"}
++            exclude={
++                "attempt",
++                "melt_lock",
++                "melt_lock_expires_at",
++                "payment_uncertain",
++                "method_data",
++            }
+         )
+         melt_quote_dict['state'] = str(melt_quote_dict['state'])
+         del melt_quote_dict['mint']
+diff --git a/cashu/mint/migrations.py b/cashu/mint/migrations.py
+index 3580fc2a..93103ac4 100644
+--- a/cashu/mint/migrations.py
++++ b/cashu/mint/migrations.py
+@@ -1384,3 +1384,40 @@ async def m042_add_melt_execution_leases(db: Database):
+         await conn.execute(
+             f"UPDATE {table} SET payment_uncertain = 1 WHERE state = 'PENDING'"
+         )
++
++
++async def m043_add_payment_method_data_to_quotes(db: Database):
++    """Add opaque, server-internal storage for method-specific quote state."""
++    async with db.connect() as conn:
++        await conn.execute(
++            f"ALTER TABLE {db.table_with_schema('mint_quotes')} "
++            "ADD COLUMN method_data TEXT"
++        )
++        await conn.execute(
++            f"ALTER TABLE {db.table_with_schema('melt_quotes')} "
++            "ADD COLUMN method_data TEXT"
++        )
++
++
++async def m044_backfill_mint_quote_accounting(db: Database):
++    """Backfill cumulative accounting for quotes created before it was tracked.
++
++    m036 added these columns without populating them, so databases that ran it
++    still hold NULLs for older quotes.
++    """
++    async with db.connect() as conn:
++        await conn.execute(
++            f"""
++                UPDATE {db.table_with_schema('mint_quotes')}
++                SET amount_paid = CASE
++                        WHEN state IN ('PAID', 'ISSUED') THEN amount
++                        ELSE 0
++                    END,
++                    amount_issued = CASE
++                        WHEN state = 'ISSUED' THEN amount
++                        ELSE 0
++                    END,
++                    updated_at = COALESCE(updated_at, issued_time, paid_time, created_time)
++                WHERE amount_paid IS NULL OR amount_issued IS NULL
++            """
++        )
+diff --git a/cashu/mint/protocols.py b/cashu/mint/protocols.py
+index 019477bf..3df8bba2 100644
+--- a/cashu/mint/protocols.py
++++ b/cashu/mint/protocols.py
+@@ -1,9 +1,8 @@
+-from typing import Dict, List, Mapping, Optional, Protocol
++from typing import Any, Dict, List, Mapping, Optional, Protocol, Union
+ 
+ from ..core.base import Method, MintKeyset, Unit
+ from ..core.crypto.secp import PublicKey
+ from ..core.db import Database
+-from ..lightning.base import LightningBackend
+ from ..mint.crud import LedgerCrud
+ from .db.read import DbReadHelper
+ from .db.write import DbWriteHelper
+@@ -13,6 +12,7 @@ from .events.events import LedgerEventManager
+ class SupportsSeed(Protocol):
+     seed: Optional[str]
+ 
++
+ class SupportsKeysets(Protocol):
+     amounts: List[int]
+     keyset: MintKeyset
+@@ -21,7 +21,7 @@ class SupportsKeysets(Protocol):
+ 
+ 
+ class SupportsBackends(Protocol):
+-    backends: Mapping[Method, Mapping[Unit, LightningBackend]] = {}
++    backends: Mapping[Union[Method, str], Mapping[Unit, Any]] = {}
+ 
+ 
+ class SupportsPubkey(Protocol):
+diff --git a/cashu/mint/router.py b/cashu/mint/router.py
+index e7b5a977..26e6c9aa 100644
+--- a/cashu/mint/router.py
++++ b/cashu/mint/router.py
+@@ -10,7 +10,8 @@ from fastapi.templating import Jinja2Templates
+ from loguru import logger
+ from pydantic import BeforeValidator
+ 
+-from ..core.errors import KeysetNotFoundError
++from ..core.base import Method
++from ..core.errors import KeysetNotFoundError, NotAllowedError
+ from ..core.models import (
+     GetInfoResponse,
+     KeysetsResponse,
+@@ -52,6 +53,7 @@ from ..core.nuts.nuts import (
+ )
+ from ..core.settings import settings
+ from ..mint.startup import ledger
++from ..payment import payment_method_registry
+ from .cache import RedisCache
+ from .limit import limit_websocket, limiter
+ from .validation import validate_input_secret_lengths
+@@ -111,7 +113,14 @@ async def index(request: Request) -> HTMLResponse:
+     # Methods (Minting / Melting)
+     mint_methods = []
+     melt_methods = []
+-    backends_methods = sorted(list(set(m.name.upper() for m in ledger.backends.keys())))
++    backends_methods = sorted(
++        list(
++            set(
++                (m.name if isinstance(m, Method) else m).upper()
++                for m in ledger.backends.keys()
++            )
++        )
++    )
+     if not settings.mint_bolt11_disable_mint:
+         mint_methods = backends_methods
+     if not settings.mint_bolt11_disable_melt:
+@@ -352,7 +361,7 @@ async def keysets() -> KeysetsResponse:
+ 
+ 
+ @router.post(
+-    "/v1/mint/quote/bolt11",
++    "/v1/mint/quote/{method}",
+     name="Request mint quote",
+     summary="Request a quote for minting of new tokens",
+     response_model=PostMintQuoteResponse,
+@@ -361,7 +370,7 @@ async def keysets() -> KeysetsResponse:
+ )
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+ async def mint_quote(
+-    request: Request, payload: PostMintQuoteRequest
++    request: Request, method: str, payload: PostMintQuoteRequest
+ ) -> PostMintQuoteResponse:
+     """
+     Request minting of new tokens. The mint responds with a Lightning invoice.
+@@ -370,57 +379,72 @@ async def mint_quote(
+     Call `POST /v1/mint/bolt11` after paying the invoice.
+     """
+     logger.trace(f"> POST /v1/mint/quote/bolt11: payload={payload}")
+-    quote = await ledger.mint_quote(payload)
+-    resp = PostMintQuoteResponse(
+-        quote=quote.quote,
+-        request=quote.request,
+-        amount=quote.amount,
+-        unit=quote.unit,
+-        method=quote.method,
+-        state=str(quote.state.value),
+-        expiry=quote.expiry,
+-        pubkey=quote.pubkey,
+-        amount_paid=quote.amount_paid,
+-        amount_issued=quote.amount_issued,
+-        updated_at=quote.updated_at,
+-    )
++    plugin = payment_method_registry.get(method)
++    validated_payload = plugin.validate_mint_quote_request(payload.model_dump())
++    if method == Method.bolt11.name:
++        quote = await ledger.mint_quote(validated_payload)
++    else:
++        quote = await ledger.mint_quote(validated_payload, method)
++    if method == Method.bolt11.name:
++        resp = PostMintQuoteResponse(
++            quote=quote.quote,
++            request=quote.request,
++            amount=quote.amount,
++            unit=quote.unit,
++            method=quote.method,
++            state=str(quote.state.value),
++            expiry=quote.expiry,
++            pubkey=quote.pubkey,
++            amount_paid=quote.amount_paid,
++            amount_issued=quote.amount_issued,
++            updated_at=quote.updated_at,
++        )
++    else:
++        resp = PostMintQuoteResponse.from_mint_quote(quote)
+     logger.trace(f"< POST /v1/mint/quote/bolt11: {resp}")
+     return resp
+ 
+ 
+ @router.get(
+-    "/v1/mint/quote/bolt11/{quote}",
++    "/v1/mint/quote/{method}/{quote}",
+     summary="Get mint quote",
+     response_model=PostMintQuoteResponse,
+     response_model_exclude_none=True,
+     response_description="Get an existing mint quote to check its status.",
+ )
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+-async def get_mint_quote(request: Request, quote: str) -> PostMintQuoteResponse:
++async def get_mint_quote(
++    request: Request, method: str, quote: str
++) -> PostMintQuoteResponse:
+     """
+     Get mint quote state.
+     """
+     logger.trace(f"> GET /v1/mint/quote/bolt11/{quote}")
+     mint_quote = await ledger.get_mint_quote(quote)
+-    resp = PostMintQuoteResponse(
+-        quote=mint_quote.quote,
+-        request=mint_quote.request,
+-        amount=mint_quote.amount,
+-        unit=mint_quote.unit,
+-        method=mint_quote.method,
+-        state=str(mint_quote.state.value),
+-        expiry=mint_quote.expiry,
+-        pubkey=mint_quote.pubkey,
+-        amount_paid=mint_quote.amount_paid,
+-        amount_issued=mint_quote.amount_issued,
+-        updated_at=mint_quote.updated_at,
+-    )
++    if mint_quote.method != method:
++        raise NotAllowedError("quote payment method does not match endpoint")
++    if method == Method.bolt11.name:
++        resp = PostMintQuoteResponse(
++            quote=mint_quote.quote,
++            request=mint_quote.request,
++            amount=mint_quote.amount,
++            unit=mint_quote.unit,
++            method=mint_quote.method,
++            state=str(mint_quote.state.value),
++            expiry=mint_quote.expiry,
++            pubkey=mint_quote.pubkey,
++            amount_paid=mint_quote.amount_paid,
++            amount_issued=mint_quote.amount_issued,
++            updated_at=mint_quote.updated_at,
++        )
++    else:
++        resp = PostMintQuoteResponse.from_mint_quote(mint_quote)
+     logger.trace(f"< GET /v1/mint/quote/bolt11/{quote}")
+     return resp
+ 
+ 
+ @router.post(
+-    "/v1/mint/quote/bolt11/check",
++    "/v1/mint/quote/{method}/check",
+     name="Batch check mint quotes",
+     summary="Batch check mint quotes",
+     response_model=list[PostMintQuoteResponse],
+@@ -429,32 +453,19 @@ async def get_mint_quote(request: Request, quote: str) -> PostMintQuoteResponse:
+ )
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+ async def mint_quote_check(
+-    request: Request, payload: PostMintQuoteCheckRequest
++    request: Request, method: str, payload: PostMintQuoteCheckRequest
+ ) -> list[PostMintQuoteResponse]:
+     logger.trace(f"> POST /v1/mint/quote/bolt11/check: payload={payload}")
+     quotes = await ledger.mint_quote_check(payload)
+-    resp = [
+-        PostMintQuoteResponse(
+-            quote=quote.quote,
+-            request=quote.request,
+-            amount=quote.amount,
+-            unit=quote.unit,
+-            method=quote.method,
+-            state=str(quote.state.value),
+-            expiry=quote.expiry,
+-            pubkey=quote.pubkey,
+-            amount_paid=quote.amount_paid,
+-            amount_issued=quote.amount_issued,
+-            updated_at=quote.updated_at,
+-        )
+-        for quote in quotes
+-    ]
++    if any(quote.method != method for quote in quotes):
++        raise NotAllowedError("quote payment method does not match endpoint")
++    resp = [PostMintQuoteResponse.from_mint_quote(quote) for quote in quotes]
+     logger.trace(f"< POST /v1/mint/quote/bolt11/check: {resp}")
+     return resp
+ 
+ 
+ @router.post(
+-    "/v1/mint/bolt11/batch",
++    "/v1/mint/{method}/batch",
+     name="Batch mint tokens",
+     summary="Batch mint tokens",
+     response_model=PostMintBatchResponse,
+@@ -463,10 +474,10 @@ async def mint_quote_check(
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+ @redis.cache()
+ async def mint_batch(
+-    request: Request, payload: PostMintBatchRequest
++    request: Request, method: str, payload: PostMintBatchRequest
+ ) -> PostMintBatchResponse:
+     logger.trace(f"> POST /v1/mint/bolt11/batch: payload={payload}")
+-    signatures = await ledger.mint_batch(payload)
++    signatures = await ledger.mint_batch(payload, method_str=method)
+     resp = PostMintBatchResponse(signatures=signatures)
+     logger.trace(f"< POST /v1/mint/bolt11/batch: {resp}")
+     return resp
+@@ -500,7 +511,7 @@ async def websocket_endpoint(websocket: WebSocket):
+ 
+ 
+ @router.post(
+-    "/v1/mint/bolt11",
++    "/v1/mint/{method}",
+     name="Mint tokens with a Lightning payment",
+     summary="Mint tokens by paying a bolt11 Lightning invoice.",
+     response_model=PostMintResponse,
+@@ -512,6 +523,7 @@ async def websocket_endpoint(websocket: WebSocket):
+ @redis.cache()
+ async def mint(
+     request: Request,
++    method: str,
+     payload: PostMintRequest,
+ ) -> PostMintResponse:
+     """
+@@ -522,7 +534,10 @@ async def mint(
+     logger.trace(f"> POST /v1/mint/bolt11: {payload}")
+ 
+     promises = await ledger.mint(
+-        outputs=payload.outputs, quote_id=payload.quote, signature=payload.signature
++        outputs=payload.outputs,
++        quote_id=payload.quote,
++        signature=payload.signature,
++        method_str=method,
+     )
+     blinded_signatures = PostMintResponse(signatures=promises)
+     logger.trace(f"< POST /v1/mint/bolt11: {blinded_signatures}")
+@@ -530,55 +545,67 @@ async def mint(
+ 
+ 
+ @router.post(
+-    "/v1/melt/quote/bolt11",
++    "/v1/melt/quote/{method}",
+     summary="Request a quote for melting tokens",
+     response_model=PostMeltQuoteResponse,
+     response_description="Melt tokens for a payment on a supported payment method.",
+ )
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+ async def melt_quote(
+-    request: Request, payload: PostMeltQuoteRequest
++    request: Request, method: str, payload: PostMeltQuoteRequest
+ ) -> PostMeltQuoteResponse:
+     """
+     Request a quote for melting tokens.
+     """
+     logger.trace(f"> POST /v1/melt/quote/bolt11: {payload}")
+-    quote = await ledger.melt_quote(payload)  # TODO
++    plugin = payment_method_registry.get(method)
++    validated_payload = plugin.validate_melt_quote_request(payload.model_dump())
++    if method == Method.bolt11.name:
++        quote = await ledger.melt_quote(validated_payload)
++    else:
++        quote = await ledger.melt_quote(validated_payload, method)
+     logger.trace(f"< POST /v1/melt/quote/bolt11: {quote}")
+     return quote
+ 
+ 
+ @router.get(
+-    "/v1/melt/quote/bolt11/{quote}",
++    "/v1/melt/quote/{method}/{quote}",
+     summary="Get melt quote",
+     response_model=PostMeltQuoteResponse,
+     response_description="Get an existing melt quote to check its status.",
+ )
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+-async def get_melt_quote(request: Request, quote: str) -> PostMeltQuoteResponse:
++async def get_melt_quote(
++    request: Request, method: str, quote: str
++) -> PostMeltQuoteResponse:
+     """
+     Get melt quote state.
+     """
+     logger.trace(f"> GET /v1/melt/quote/bolt11/{quote}")
+     melt_quote = await ledger.get_melt_quote(quote)
+-    resp = PostMeltQuoteResponse(
+-        quote=melt_quote.quote,
+-        amount=melt_quote.amount,
+-        unit=melt_quote.unit,
+-        method=melt_quote.method,
+-        request=melt_quote.request,
+-        fee_reserve=melt_quote.fee_reserve,
+-        state=melt_quote.state.value,
+-        expiry=melt_quote.expiry,
+-        payment_preimage=melt_quote.payment_preimage,
+-        change=melt_quote.change,
+-    )
++    if melt_quote.method != method:
++        raise NotAllowedError("quote payment method does not match endpoint")
++    if method == Method.bolt11.name:
++        resp = PostMeltQuoteResponse(
++            quote=melt_quote.quote,
++            amount=melt_quote.amount,
++            unit=melt_quote.unit,
++            method=melt_quote.method,
++            request=melt_quote.request,
++            fee_reserve=melt_quote.fee_reserve,
++            state=str(melt_quote.state.value),
++            expiry=melt_quote.expiry,
++            payment_preimage=melt_quote.payment_preimage,
++            change=melt_quote.change,
++        )
++    else:
++        resp = PostMeltQuoteResponse.from_melt_quote(melt_quote)
+     logger.trace(f"< GET /v1/melt/quote/bolt11/{quote}")
+     return resp
+ 
+ 
+ @router.post(
+-    "/v1/melt/bolt11",
++    "/v1/melt/{method}",
+     name="Melt tokens",
+     summary=(
+         "Melt tokens for a Bitcoin payment that the mint will make for the user in"
+@@ -594,6 +621,7 @@ async def get_melt_quote(request: Request, quote: str) -> PostMeltQuoteResponse:
+ @redis.cache()
+ async def melt(
+     request: Request,
++    method: str,
+     payload: Annotated[PostMeltRequest, BeforeValidator(validate_input_secret_lengths)],
+ ) -> PostMeltQuoteResponse:
+     """
+@@ -602,11 +630,17 @@ async def melt(
+     logger.trace(f"> POST /v1/melt/bolt11: {payload}")
+     if payload.prefer_async:
+         resp = await ledger.async_melt(
+-            proofs=payload.inputs, quote=payload.quote, outputs=payload.outputs
++            proofs=payload.inputs,
++            quote=payload.quote,
++            outputs=payload.outputs,
++            method_str=method,
+         )
+     else:
+         resp = await ledger.melt(
+-            proofs=payload.inputs, quote=payload.quote, outputs=payload.outputs
++            proofs=payload.inputs,
++            quote=payload.quote,
++            outputs=payload.outputs,
++            method_str=method,
+         )
+     logger.trace(f"< POST /v1/melt/bolt11: {resp}")
+     return resp
+diff --git a/cashu/mint/startup.py b/cashu/mint/startup.py
+index 7167b190..1ace350d 100644
+--- a/cashu/mint/startup.py
++++ b/cashu/mint/startup.py
+@@ -5,7 +5,7 @@ import asyncio
+ import hashlib
+ import importlib
+ from copy import copy
+-from typing import Dict
++from typing import Any, Dict, Union
+ 
+ from loguru import logger
+ 
+@@ -15,12 +15,12 @@ from ..core.base import Method, Unit
+ from ..core.db import Database, mask_db_location
+ from ..core.migrations import migrate_databases
+ from ..core.settings import settings
+-from ..lightning.base import LightningBackend
+ from ..mint import migrations as mint_migrations
+ from ..mint.auth import migrations as auth_migrations
+ from ..mint.auth.server import AuthLedger
+ from ..mint.crud import LedgerCrudSqlite
+ from ..mint.ledger import Ledger
++from ..payment import payment_method_registry
+ 
+ # kill the program if python runs in non-__debug__ mode
+ # which could lead to asserts not being executed for optimized code
+@@ -51,27 +51,45 @@ for key, value in settings.model_dump().items():
+ 
+ wallets_module = importlib.import_module("cashu.lightning")
+ 
+-backends: Dict[Method, Dict[Unit, LightningBackend]] = {}
++payment_method_registry.load_entry_points(settings.mint_payment_method_plugins)
++
++backends: Dict[Union[Method, str], Dict[Unit, Any]] = {}
+ if settings.mint_backend_bolt11_sat:
+-    backend_bolt11_sat = getattr(wallets_module, settings.mint_backend_bolt11_sat)(
++    backend_bolt11_sat = vars(wallets_module)[settings.mint_backend_bolt11_sat](
+         unit=Unit.sat
+     )
+     backends.setdefault(Method.bolt11, {})[Unit.sat] = backend_bolt11_sat
+ if settings.mint_backend_bolt11_msat:
+-    backend_bolt11_msat = getattr(wallets_module, settings.mint_backend_bolt11_msat)(
++    backend_bolt11_msat = vars(wallets_module)[settings.mint_backend_bolt11_msat](
+         unit=Unit.msat
+     )
+     backends.setdefault(Method.bolt11, {})[Unit.msat] = backend_bolt11_msat
+ if settings.mint_backend_bolt11_usd:
+-    backend_bolt11_usd = getattr(wallets_module, settings.mint_backend_bolt11_usd)(
++    backend_bolt11_usd = vars(wallets_module)[settings.mint_backend_bolt11_usd](
+         unit=Unit.usd
+     )
+     backends.setdefault(Method.bolt11, {})[Unit.usd] = backend_bolt11_usd
+ if settings.mint_backend_bolt11_eur:
+-    backend_bolt11_eur = getattr(wallets_module, settings.mint_backend_bolt11_eur)(
++    backend_bolt11_eur = vars(wallets_module)[settings.mint_backend_bolt11_eur](
+         unit=Unit.eur
+     )
+     backends.setdefault(Method.bolt11, {})[Unit.eur] = backend_bolt11_eur
++for backend_config in settings.mint_payment_backends:
++    method = str(backend_config.get("method", ""))
++    unit_name = str(backend_config.get("unit", ""))
++    plugin = payment_method_registry.get(method)
++    try:
++        unit = Unit[unit_name]
++    except KeyError as exc:
++        raise ValueError(
++            f"unsupported unit '{unit_name}' for payment method '{method}'"
++        ) from exc
++    if method == Method.bolt11.name and unit in backends.get(Method.bolt11, {}):
++        raise ValueError(
++            f"duplicate backend configuration for method '{method}' and unit '{unit.name}'"
++        )
++    backend = plugin.create_backend(unit, backend_config)
++    backends.setdefault(method, {})[unit] = backend
+ if not backends:
+     raise Exception("No backends are set.")
+ 
+diff --git a/cashu/mint/tasks.py b/cashu/mint/tasks.py
+index d7654749..06f25a68 100644
+--- a/cashu/mint/tasks.py
++++ b/cashu/mint/tasks.py
+@@ -1,13 +1,12 @@
+ import asyncio
+-import time
+-from typing import List
++from typing import Any, List, Union
+ 
+ from loguru import logger
+ 
+-from ..core.base import MintQuoteState
++from ..core.base import Method, MintQuoteState, Unit
+ from ..core.db import LockOptions
+ from ..core.settings import settings
+-from ..lightning.base import LightningBackend
++from ..payment import payment_method_registry
+ from .protocols import SupportsBackends, SupportsDb, SupportsEvents
+ 
+ 
+@@ -19,11 +18,17 @@ class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
+                 logger.debug(
+                     f"Dispatching backend invoice listener for {method} {unit} {backend.__class__.__name__}"
+                 )
+-                tasks.append(asyncio.create_task(self.invoice_listener(backend)))
++                tasks.append(
++                    asyncio.create_task(self.invoice_listener(method, unit, backend))
++                )
+         return tasks
+ 
+-    async def invoice_listener(self, backend: LightningBackend) -> None:
+-        if backend.supports_incoming_payment_stream:
++    async def invoice_listener(
++        self, method: Union[Method, str], unit: Unit, backend: Any
++    ) -> None:
++        method_name = method.name if isinstance(method, Method) else method
++        plugin = payment_method_registry.get(method_name)
++        if plugin.supports_incoming_payment_stream(backend):
+             retry_delay = settings.mint_retry_exponential_backoff_base_delay
+             max_retry_delay = settings.mint_retry_exponential_backoff_max_delay
+ 
+@@ -31,8 +36,10 @@ class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
+                 try:
+                     # Reset retry delay on successful connection to backend stream
+                     retry_delay = settings.mint_retry_exponential_backoff_base_delay
+-                    async for checking_id in backend.paid_invoices_stream():
+-                        await self.invoice_callback_dispatcher(checking_id)
++                    async for checking_id in plugin.incoming_payment_stream(backend):
++                        await self.invoice_callback_dispatcher(
++                            checking_id, method_name, unit
++                        )
+                 except Exception as e:
+                     logger.error(f"Error in invoice listener: {e}")
+                     logger.info(
+@@ -43,7 +50,12 @@ class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
+                     # Exponential backoff
+                     retry_delay = min(retry_delay * 2, max_retry_delay)
+ 
+-    async def invoice_callback_dispatcher(self, checking_id: str) -> None:
++    async def invoice_callback_dispatcher(
++        self,
++        checking_id: str,
++        method: str = Method.bolt11.name,
++        unit: Unit | None = None,
++    ) -> None:
+         logger.debug(f"Invoice callback dispatcher: {checking_id}")
+         async with self.db.get_connection(
+             locks=[
+@@ -56,23 +68,25 @@ class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
+             ],
+         ) as conn:
+             quote = await self.crud.get_mint_quote(
+-                checking_id=checking_id, db=self.db, conn=conn
++                checking_id=checking_id,
++                method=method,
++                db=self.db,
++                conn=conn,
+             )
+             if not quote:
+                 logger.error(f"Quote not found for {checking_id}")
+                 return
++            if unit is not None and quote.unit != unit.name:
++                logger.error(
++                    f"Quote unit mismatch for {method}:{checking_id}: {quote.unit}"
++                )
++                return
+ 
+             logger.trace(
+                 f"Invoice callback dispatcher: quote {quote} trying to set as {MintQuoteState.paid}"
+             )
+-            # set the quote as paid
+-            if quote.unpaid:
+-                quote.state = MintQuoteState.paid
+-                quote.paid_time = int(time.time())
+-                quote.updated_at = int(time.time())
+-                await self.crud.update_mint_quote(quote=quote, db=self.db, conn=conn)
+-                logger.trace(
+-                    f"Quote {quote.quote} with {MintQuoteState.unpaid} set as {quote.state.value}"
+-                )
+-
+-        await self.events.submit(quote)
++        # Fetch the cumulative paid amount through the normal quote refresh path.
++        # Reusable methods may emit more than one event for the same checking ID.
++        await self.get_mint_quote(  # type: ignore[attr-defined]
++            quote.quote, force_backend_check=True
++        )
+diff --git a/cashu/mint/verification.py b/cashu/mint/verification.py
+index 9f47c46f..40ad2a54 100644
+--- a/cashu/mint/verification.py
++++ b/cashu/mint/verification.py
+@@ -1,4 +1,4 @@
+-from typing import List, Literal, Optional, Tuple, Union
++from typing import Any, List, Literal, Optional, Tuple, Union
+ 
+ import bolt11
+ from loguru import logger
+@@ -395,9 +395,12 @@ class LedgerVerification(
+ 
+     def _verify_and_get_unit_method(
+         self, unit_str: str, method_str: str
+-    ) -> Tuple[Unit, Method]:
++    ) -> Tuple[Unit, Union[Method, str]]:
+         """Verify that the unit is supported by the ledger."""
+-        method = Method[method_str]
++        try:
++            method: Union[Method, str] = Method[method_str]
++        except KeyError:
++            method = method_str
+         unit = Unit[unit_str]
+ 
+         if not any([unit == k.unit for k in self.keysets.values()]):
+@@ -407,11 +410,18 @@ class LedgerVerification(
+ 
+         if not self.backends.get(method) or unit not in self.backends[method]:
+             raise NotAllowedError(
+-                f"no support for method '{method.name}' with unit '{unit.name}'."
++                f"no support for method '{self._method_name(method)}' with unit '{unit.name}'."
+             )
+ 
+         return unit, method
+ 
++    @staticmethod
++    def _method_name(method: Union[Method, str]) -> str:
++        return method.name if isinstance(method, Method) else method
++
++    def _get_backend(self, method: Union[Method, str], unit: Unit) -> Any:
++        return self.backends[method][unit]
++
+     def _verify_mint_quote_witness(
+         self,
+         quote: MintQuote,
+diff --git a/cashu/mint/watchdog.py b/cashu/mint/watchdog.py
+index 60bc1503..feb33d83 100644
+--- a/cashu/mint/watchdog.py
++++ b/cashu/mint/watchdog.py
+@@ -1,14 +1,15 @@
+ import asyncio
+ import signal
+-from typing import List, Optional, Tuple
++from typing import Any, List, Optional, Tuple
+ 
+ from loguru import logger
+ 
+ from cashu.core.db import Connection, Database
+ 
+-from ..core.base import Amount, MintBalanceLogEntry, Unit
++from ..core.base import Amount, Method, MintBalanceLogEntry, Unit
+ from ..core.settings import settings
+-from ..lightning.base import LightningBackend
++from ..lightning.base import LightningBackend, StatusResponse
++from ..payment import payment_method_registry
+ from .protocols import SupportsBackends, SupportsDb
+ 
+ 
+@@ -41,7 +42,9 @@ class LedgerWatchdog(SupportsDb, SupportsBackends):
+         for method, unitbackends in self.backends.items():
+             for unit, backend in unitbackends.items():
+                 tasks.append(
+-                    asyncio.create_task(self.dispatch_backend_checker(unit, backend))
++                    asyncio.create_task(
++                        self.dispatch_backend_checker(unit, backend, method)
++                    )
+                 )
+         tasks.append(asyncio.create_task(self.monitor_abort_queue()))
+         return tasks
+@@ -63,14 +66,21 @@ class LedgerWatchdog(SupportsDb, SupportsBackends):
+         """Returns the balance of the mint for this unit."""
+         return await self.get_unit_balance_and_fees(unit=unit, db=self.db)
+ 
++    @staticmethod
++    async def _backend_status(backend: Any, method: Any) -> StatusResponse:
++        if method is None:
++            return await backend.status()
++        name = method.name if isinstance(method, Method) else method
++        return await payment_method_registry.get(name).status(backend)
++
+     async def dispatch_backend_checker(
+-        self, unit: Unit, backend: LightningBackend
++        self, unit: Unit, backend: LightningBackend, method: Any = None
+     ) -> None:
+         logger.info(
+             f"Dispatching backend checker for unit: {unit.name} and backend: {backend.__class__.__name__}"
+         )
+         while True:
+-            backend_status = await backend.status()
++            backend_status = await self._backend_status(backend, method)
+             backend_balance = backend_status.balance
+             last_balance_log_entry: MintBalanceLogEntry | None = None
+             async with self.watcher_db.connect() as conn:
+diff --git a/cashu/payment/__init__.py b/cashu/payment/__init__.py
+new file mode 100644
+index 00000000..4b037489
+--- /dev/null
++++ b/cashu/payment/__init__.py
+@@ -0,0 +1,21 @@
++"""Payment-method plugins used by the mint and wallet.
++
++Implementations register a :class:`PaymentMethodPlugin`; the built-in BOLT11
++adapter preserves the existing Lightning backend and wire behavior.
++"""
++
++from .base import PaymentMethodPlugin
++from .bolt11 import bolt11_payment_method
++from .registry import PaymentMethodRegistry, payment_method_registry
++
++# Built-ins use the same registry as third-party plugins. Importing the payment
++# package is therefore sufficient for library users; no mint startup side effect
++# is required to make BOLT11 available.
++if payment_method_registry.maybe_get(bolt11_payment_method.method) is None:
++    payment_method_registry.register(bolt11_payment_method)
++
++__all__ = [
++    "PaymentMethodPlugin",
++    "PaymentMethodRegistry",
++    "payment_method_registry",
++]
+diff --git a/cashu/payment/base.py b/cashu/payment/base.py
+new file mode 100644
+index 00000000..39f0085f
+--- /dev/null
++++ b/cashu/payment/base.py
+@@ -0,0 +1,143 @@
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from typing import Any, AsyncGenerator, Optional
++
++from pydantic import BaseModel, ConfigDict, Field
++
++from ..core.base import Amount, MeltQuote, MintQuote, Unit
++from ..core.models import PostMeltQuoteRequest, PostMintQuoteRequest
++from ..lightning.base import (
++    InvoiceResponse,
++    PaymentQuoteResponse,
++    PaymentResponse,
++    PaymentStatus,
++    StatusResponse,
++)
++
++
++class PaymentMethodSettings(BaseModel):
++    """NUT-04/NUT-05 settings advertised for a method-unit pair."""
++
++    model_config = ConfigDict(extra="allow")
++
++    method_name: Optional[str] = None
++    min_amount: Optional[int] = Field(default=None, ge=0)
++    max_amount: Optional[int] = Field(default=None, ge=0)
++    options: Optional[dict[str, Any]] = None
++    mint_enabled: bool = True
++    melt_enabled: bool = True
++
++
++class PaymentMethodPlugin(ABC):
++    """Protocol boundary between Cashu quote orchestration and a payment rail.
++
++    Method-specific parsing, canonicalization, fee conventions and proofs belong
++    here.  The ledger only handles Cashu accounting and proof state transitions.
++    """
++
++    method: str
++    mint_quote_request_model: type[BaseModel] = PostMintQuoteRequest
++    melt_quote_request_model: type[BaseModel] = PostMeltQuoteRequest
++    allows_partial_mint: bool = False
++
++    def create_backend(self, unit: Unit, config: dict[str, Any]) -> Any:
++        """Construct a configured mint backend for this method.
++
++        Third-party plugins override this hook. BOLT11 remains configured through
++        its historical environment variables for backwards compatibility.
++        """
++        raise NotImplementedError(
++            f"payment method '{self.method}' does not provide a backend factory"
++        )
++
++    def validate_mint_quote_request(self, payload: Any) -> PostMintQuoteRequest:
++        return self.mint_quote_request_model.model_validate(payload)  # type: ignore[return-value]
++
++    def validate_melt_quote_request(self, payload: Any) -> PostMeltQuoteRequest:
++        return self.melt_quote_request_model.model_validate(payload)  # type: ignore[return-value]
++
++    def settings_for(self, backend: Any, unit: Unit) -> PaymentMethodSettings:
++        return PaymentMethodSettings(method_name=self.method)
++
++    def supports_description(self, backend: Any) -> bool:
++        return False
++
++    def supports_mpp(self, backend: Any) -> bool:
++        return False
++
++    def supports_incoming_payment_stream(self, backend: Any) -> bool:
++        return False
++
++    def canonicalize_request(self, request: str) -> str:
++        return request
++
++    @abstractmethod
++    async def create_incoming_payment(
++        self, backend: Any, request: PostMintQuoteRequest
++    ) -> InvoiceResponse:
++        """Create payment instructions for a mint quote."""
++
++    @abstractmethod
++    async def get_incoming_payment_status(
++        self, backend: Any, quote: MintQuote
++    ) -> PaymentStatus:
++        """Return the current incoming payment status."""
++
++    @abstractmethod
++    async def quote_outgoing_payment(
++        self, backend: Any, request: PostMeltQuoteRequest
++    ) -> PaymentQuoteResponse:
++        """Price an outgoing payment for a melt quote."""
++
++    @abstractmethod
++    async def execute_outgoing_payment(
++        self, backend: Any, quote: MeltQuote, fee_limit: Amount
++    ) -> PaymentResponse:
++        """Execute an outgoing payment."""
++
++    @abstractmethod
++    async def get_outgoing_payment_status(
++        self, backend: Any, quote: MeltQuote
++    ) -> PaymentStatus:
++        """Return the current outgoing payment status."""
++
++    @abstractmethod
++    def quote_expiry(self, payment_request: str) -> Optional[int]:
++        """Return the payment request's absolute expiry, if it has one."""
++
++    def validate_internal_settlement(
++        self, mint_quote: MintQuote, melt_quote: MeltQuote
++    ) -> None:
++        if mint_quote.request != melt_quote.request:
++            raise ValueError("payment requests do not match")
++        if mint_quote.amount != melt_quote.amount:
++            raise ValueError("payment amounts do not match")
++
++    def validate_payment_request(self, backend: Any, request: str) -> Optional[int]:
++        """Validate a melt request locally and return its absolute expiry, if any."""
++        return self.quote_expiry(request)
++
++    def get_payment_checking_id(self, backend: Any, quote: MeltQuote) -> str:
++        """Derive the attempt's checking ID before sending, without doing I/O."""
++        return quote.checking_id
++
++    async def startup(self, backend: Any) -> None:
++        startup = getattr(backend, "startup", None)
++        if startup is not None:
++            await startup()
++
++    async def cleanup(self, backend: Any) -> None:
++        cleanup = getattr(backend, "cleanup", None)
++        if cleanup is not None:
++            await cleanup()
++
++    async def status(self, backend: Any) -> StatusResponse:
++        return await backend.status()
++
++    async def incoming_payment_stream(self, backend: Any) -> AsyncGenerator[str, None]:
++        async for checking_id in backend.paid_invoices_stream():
++            yield checking_id
++
++    def funding_source_id(self, backend: Any, unit: Unit) -> str:
++        return f"{backend.__class__.__module__}.{backend.__class__.__qualname__}:{unit.name}:{id(backend)}"
+diff --git a/cashu/payment/bolt11.py b/cashu/payment/bolt11.py
+new file mode 100644
+index 00000000..66b52680
+--- /dev/null
++++ b/cashu/payment/bolt11.py
+@@ -0,0 +1,84 @@
++from __future__ import annotations
++
++from typing import Any, Optional
++
++import bolt11
++
++from ..core.base import Amount, MeltQuote, MintQuote, Unit
++from ..core.models import PostMeltQuoteRequest, PostMintQuoteRequest
++from ..lightning.base import (
++    InvoiceResponse,
++    LightningBackend,
++    PaymentQuoteResponse,
++    PaymentResponse,
++    PaymentStatus,
++)
++from .base import PaymentMethodPlugin, PaymentMethodSettings
++
++
++class Bolt11PaymentMethod(PaymentMethodPlugin):
++    method = "bolt11"
++
++    def supports_description(self, backend: LightningBackend) -> bool:
++        return backend.supports_description
++
++    def supports_mpp(self, backend: LightningBackend) -> bool:
++        return backend.supports_mpp
++
++    def supports_incoming_payment_stream(self, backend: LightningBackend) -> bool:
++        return backend.supports_incoming_payment_stream
++
++    def settings_for(self, backend: Any, unit: Unit) -> PaymentMethodSettings:
++        return PaymentMethodSettings(
++            method_name="bolt11",
++            options={"description": bool(backend.supports_description)},
++        )
++
++    def canonicalize_request(self, request: str) -> str:
++        # BOLT11 is bech32 and therefore case-insensitive. Mixed-case strings are
++        # invalid; normalizing preserves Nutshell's historical storage behavior.
++        return request.lower()
++
++    async def create_incoming_payment(
++        self, backend: Any, request: PostMintQuoteRequest
++    ) -> InvoiceResponse:
++        return await backend.create_invoice(
++            amount=Amount(unit=Unit[request.unit], amount=request.amount),
++            memo=request.description,
++        )
++
++    async def get_incoming_payment_status(
++        self, backend: Any, quote: MintQuote
++    ) -> PaymentStatus:
++        return await backend.get_invoice_status(quote.checking_id)
++
++    async def quote_outgoing_payment(
++        self, backend: Any, request: PostMeltQuoteRequest
++    ) -> PaymentQuoteResponse:
++        return await backend.get_payment_quote(melt_quote=request)
++
++    async def execute_outgoing_payment(
++        self, backend: Any, quote: MeltQuote, fee_limit: Amount
++    ) -> PaymentResponse:
++        fee_limit_msat = fee_limit.to(Unit.msat).amount
++        return await backend.pay_invoice(quote, fee_limit_msat)
++
++    async def get_outgoing_payment_status(
++        self, backend: Any, quote: MeltQuote
++    ) -> PaymentStatus:
++        return await backend.get_payment_status(quote.checking_id)
++
++    def validate_payment_request(self, backend: Any, request: str) -> Optional[int]:
++        return backend.validate_payment_request(request)
++
++    def get_payment_checking_id(self, backend: Any, quote: MeltQuote) -> str:
++        return backend.get_payment_checking_id(quote)
++
++    def quote_expiry(self, payment_request: str) -> Optional[int]:
++        invoice = bolt11.decode(payment_request)
++        if invoice.expiry is None:
++            return None
++        return invoice.date + invoice.expiry
++
++
++bolt11_payment_method = Bolt11PaymentMethod()
+diff --git a/cashu/payment/registry.py b/cashu/payment/registry.py
+new file mode 100644
+index 00000000..5ce89604
+--- /dev/null
++++ b/cashu/payment/registry.py
+@@ -0,0 +1,67 @@
++from __future__ import annotations
++
++import re
++from importlib import metadata
++from typing import Iterable, Optional
++
++from .base import PaymentMethodPlugin
++
++PAYMENT_METHOD_PATTERN = re.compile(r"^[a-z0-9_-]+$")
++PAYMENT_METHOD_ENTRY_POINT = "cashu.payment_methods"
++
++
++class PaymentMethodRegistry:
++    def __init__(self) -> None:
++        self._plugins: dict[str, PaymentMethodPlugin] = {}
++
++    @staticmethod
++    def validate_method(method: str) -> str:
++        if not method or not PAYMENT_METHOD_PATTERN.fullmatch(method):
++            raise ValueError("payment method must match [a-z0-9_-]+")
++        return method
++
++    def register(self, plugin: PaymentMethodPlugin, *, replace: bool = False) -> None:
++        method = self.validate_method(plugin.method)
++        if method in self._plugins and not replace:
++            raise ValueError(f"payment method '{method}' is already registered")
++        self._plugins[method] = plugin
++
++    def get(self, method: str) -> PaymentMethodPlugin:
++        self.validate_method(method)
++        try:
++            return self._plugins[method]
++        except KeyError as exc:
++            raise ValueError(f"unsupported payment method '{method}'") from exc
++
++    def maybe_get(self, method: str) -> Optional[PaymentMethodPlugin]:
++        return self._plugins.get(method)
++
++    def methods(self) -> tuple[str, ...]:
++        return tuple(self._plugins)
++
++    def load_entry_points(self, allowlist: Iterable[str]) -> None:
++        allowed = set(allowlist)
++        if not allowed:
++            return
++        entry_points = metadata.entry_points()
++        selected = entry_points.select(group=PAYMENT_METHOD_ENTRY_POINT)
++        found: set[str] = set()
++        for entry_point in selected:
++            if entry_point.name not in allowed:
++                continue
++            loaded = entry_point.load()
++            plugin = loaded() if isinstance(loaded, type) else loaded
++            if not isinstance(plugin, PaymentMethodPlugin):
++                raise TypeError(
++                    f"entry point '{entry_point.name}' did not provide a PaymentMethodPlugin"
++                )
++            self.register(plugin)
++            found.add(entry_point.name)
++        missing = allowed - found
++        if missing:
++            raise ValueError(
++                "payment method plugins not installed: " + ", ".join(sorted(missing))
++            )
++
++
++payment_method_registry = PaymentMethodRegistry()
+diff --git a/cashu/wallet/cli/cli.py b/cashu/wallet/cli/cli.py
+index 75444272..58881f3a 100644
+--- a/cashu/wallet/cli/cli.py
++++ b/cashu/wallet/cli/cli.py
+@@ -44,6 +44,7 @@ from ...wallet.crud import (
+     get_bolt11_melt_quotes,
+     get_bolt11_mint_quote,
+     get_bolt11_mint_quotes,
++    get_payment_mint_quote,
+     get_reserved_proofs,
+     get_seed_and_mnemonic,
+ )
+@@ -257,7 +258,7 @@ async def cli(
+     await init_wallet(ctx.obj["WALLET"], load_proofs=False)
+ 
+ 
+-@cli.command("pay", help="Pay Lightning invoice.")
++@cli.command("pay", help="Pay a request through a mint payment method.")
+ @click.argument("invoice", type=str)
+ @click.argument(
+     "amount",
+@@ -267,6 +268,13 @@ async def cli(
+ @click.option(
+     "--yes", "-y", default=False, is_flag=True, help="Skip confirmation.", type=bool
+ )
++@click.option("--method", default="bolt11", show_default=True, type=str)
++@click.option(
++    "--method-options",
++    default="{}",
++    help="Method-specific JSON object.",
++    type=str,
++)
+ @click.option(
+     "--async",
+     "-a",
+@@ -284,7 +292,15 @@ async def pay(
+     amount: Optional[int] = None,
+     yes: bool = False,
+     prefer_async: bool = False,
++    method: str = "bolt11",
++    method_options: str = "{}",
+ ):
++    try:
++        parsed_method_options = json.loads(method_options)
++        if not isinstance(parsed_method_options, dict):
++            raise ValueError("must be a JSON object")
++    except Exception as e:
++        raise click.BadParameter(str(e), param_hint="--method-options") from e
+     pr = None
+     if invoice.startswith("creqA") or invoice.lower().startswith("creqb1"):
+         try:
+@@ -316,7 +332,9 @@ async def pay(
+         await init_wallet(ctx.obj["WALLET"], load_proofs=False)
+ 
+     ctx.obj["HOST"] = ctx.obj["WALLET"].url
+-    await _pay(ctx, invoice, amount, yes, prefer_async, pr)
++    await _pay(
++        ctx, invoice, amount, yes, prefer_async, pr, method, parsed_method_options
++    )
+ 
+ 
+ @init_auth_wallet
+@@ -327,7 +345,10 @@ async def _pay(
+     yes: bool,
+     prefer_async: bool,
+     pr: Optional[PaymentRequest],
++    method: str = "bolt11",
++    parsed_method_options: Optional[dict] = None,
+ ):
++    parsed_method_options = parsed_method_options or {}
+     wallet: Wallet = ctx.obj["WALLET"]
+     await wallet.load_mint()
+     await print_balance(ctx)
+@@ -432,8 +453,7 @@ async def _pay(
+             if post_transports:
+                 transport = post_transports[0]
+                 url = transport.a
+-                print(
+-                    f"Sending token via POST to {url}...", end="", flush=True)
++                print(f"Sending token via POST to {url}...", end="", flush=True)
+ 
+                 token_obj = deserialize_token_from_string(token)
+                 assert isinstance(
+@@ -462,7 +482,9 @@ async def _pay(
+         await print_balance(ctx)
+         return
+ 
+-    if invoice.lower().startswith("lnurl") or "@" in invoice:
++    if method == Method.bolt11.name and (
++        invoice.lower().startswith("lnurl") or "@" in invoice
++    ):
+         print(f"Resolving LNURL {invoice}...", end="", flush=True)
+         resolved_invoice = await handle_lnurl(invoice, amount)
+         if not resolved_invoice:
+@@ -472,10 +494,19 @@ async def _pay(
+         # we used the amount to resolve the LNURL, so we don't need to pass it to the mint
+         amount = None
+ 
+-    payment_hash = bolt11.decode(invoice).payment_hash
++    payment_hash = (
++        bolt11.decode(invoice).payment_hash if method == Method.bolt11.name else None
++    )
+     # we assume `amount` to be in sats
+     amount_mpp_msat = amount * 1000 if amount else None
+-    quote = await wallet.melt_quote(invoice, amount_mpp_msat)
++    if method == Method.bolt11.name:
++        quote = await wallet.melt_quote(invoice, amount_mpp_msat)
++    else:
++        if amount is not None:
++            parsed_method_options.setdefault("amount", amount)
++        quote = await wallet.melt_quote_for_method(
++            method, invoice, parsed_method_options
++        )
+     logger.debug(f"Quote: {quote}")
+     total_amount = quote.amount + quote.fee_reserve
+     # estimate ecash fee for the coinselected proofs
+@@ -517,6 +548,8 @@ async def _pay(
+             quote.fee_reserve,
+             quote.quote,
+             prefer_async=prefer_async,
++            method=method,
++            method_options=parsed_method_options,
+         )
+     except Exception as e:
+         print(f" Error paying invoice: {e}")
+@@ -530,7 +563,9 @@ async def _pay(
+             melt_response.payment_preimage
+             and melt_response.payment_preimage != "0" * 64
+         ):
+-            if not check_payment_preimage(payment_hash, melt_response.payment_preimage):
++            if payment_hash and not check_payment_preimage(
++                payment_hash, melt_response.payment_preimage
++            ):
+                 print(" Error: Invalid preimage!", end="", flush=True)
+             print(f" (Preimage: {melt_response.payment_preimage}).")
+         else:
+@@ -625,7 +660,7 @@ async def request(
+     print(encoded)
+ 
+ 
+-@cli.command("invoice", help="Create Lighting invoice.")
++@cli.command("invoice", help="Create a mint payment request.")
+ @click.argument("amount", type=float)
+ @click.option("memo", "-m", default="", help="Memo for the invoice.", type=str)
+ @click.option("--id", default="", help="Id of the paid invoice.", type=str)
+@@ -636,6 +671,13 @@ async def request(
+     help="Split minted tokens with a specific amount.",
+     type=int,
+ )
++@click.option("--method", default="bolt11", show_default=True, type=str)
++@click.option(
++    "--method-options",
++    default="{}",
++    help="Method-specific JSON object.",
++    type=str,
++)
+ @click.option(
+     "--no-check",
+     "-n",
+@@ -654,12 +696,19 @@ async def invoice(
+     id: str,
+     split: int,
+     no_check: bool,
++    method: str,
++    method_options: str,
+ ):
+     wallet: Wallet = ctx.obj["WALLET"]
+     await wallet.load_mint()
+     await print_balance(ctx)
+-    amount = int(
+-        amount * 100) if wallet.unit in [Unit.usd, Unit.eur] else int(amount)
++    try:
++        parsed_method_options = json.loads(method_options)
++        if not isinstance(parsed_method_options, dict):
++            raise ValueError("must be a JSON object")
++    except Exception as e:
++        raise click.BadParameter(str(e), param_hint="--method-options") from e
++    amount = int(amount * 100) if wallet.unit in [Unit.usd, Unit.eur] else int(amount)
+     print(f"Requesting invoice for {wallet.unit.str(amount)}.")
+     # in case the user wants a specific split, we create a list of amounts
+     optional_split = None
+@@ -708,6 +757,7 @@ async def invoice(
+                         ws_quote_resp.amount or mint_quote.amount,
+                         split=optional_split,
+                         quote_id=mint_quote.quote,
++                        method=method,
+                     )
+                 )
+                 # set paid so we won't react to any more callbacks
+@@ -721,8 +771,8 @@ async def invoice(
+ 
+     # user requests an invoice
+     if amount and not id:
+-        mint_supports_websockets = wallet.mint_info.supports_websocket_mint_quote(
+-            Method.bolt11, wallet.unit
++        mint_supports_websockets = method == Method.bolt11.name and (
++            wallet.mint_info.supports_websocket_mint_quote(Method.bolt11, wallet.unit)
+         )
+         if mint_supports_websockets and not no_check:
+             mint_quote, subscription = await wallet.request_mint_with_callback(
+@@ -730,7 +780,15 @@ async def invoice(
+             )
+             invoice_nonlocal, subscription_nonlocal = mint_quote, subscription
+         else:
+-            mint_quote = await wallet.request_mint(amount, memo=memo)
++            if method == Method.bolt11.name:
++                mint_quote = await wallet.request_mint(amount, memo=memo)
++            else:
++                mint_quote = await wallet.request_mint_for_method(
++                    method,
++                    amount,
++                    memo=memo,
++                    method_options=parsed_method_options,
++                )
+         amount = mint_quote.amount
+         if split:
+             assert amount % split == 0, "split must be divisor of quoted amount"
+@@ -754,7 +812,9 @@ async def invoice(
+                 flush=True,
+             )
+         if mint_supports_websockets:
+-            ws_deadline = mint_quote.expiry or (time.time() + 5 * 60)  # wait for five minutes
++            ws_deadline = mint_quote.expiry or (
++                time.time() + 5 * 60
++            )  # wait for five minutes
+             while not paid and time.time() < ws_deadline:
+                 await asyncio.sleep(0.1)
+ 
+@@ -763,12 +823,15 @@ async def invoice(
+         while time.time() < check_until and not paid:
+             await asyncio.sleep(5)
+             try:
+-                mint_quote = await wallet.get_mint_quote(mint_quote.quote)
++                mint_quote = await wallet.get_mint_quote_for_method(
++                    method, mint_quote.quote
++                )
+                 if mint_quote.state == MintQuoteState.paid:
+                     await wallet.mint(
+                         mint_quote.amount,
+                         split=optional_split,
+                         quote_id=mint_quote.quote,
++                        method=method,
+                     )
+                     paid = True
+                 else:
+@@ -789,7 +852,7 @@ async def invoice(
+ 
+     # user paid invoice before and wants to check the quote id
+     elif amount and id:
+-        quote = await get_bolt11_mint_quote(wallet.db, quote=id)
++        quote = await get_payment_mint_quote(wallet.db, quote=id, method=method)
+         if not quote:
+             raise Exception("Quote not found")
+         if split:
+@@ -799,6 +862,7 @@ async def invoice(
+             quote.amount,
+             split=optional_split,
+             quote_id=quote.quote,
++            method=method,
+         )
+ 
+     # close open subscriptions so we can exit
+@@ -833,8 +897,7 @@ async def swap(ctx: Context):
+     if incoming_wallet.url == outgoing_wallet.url:
+         raise Exception("mints for swap have to be different")
+ 
+-    amount = int(
+-        input(f"Enter amount to swap in {incoming_wallet.unit.name}: "))
++    amount = int(input(f"Enter amount to swap in {incoming_wallet.unit.name}: "))
+     assert amount > 0, "amount is not positive"
+ 
+     # request invoice from incoming mint
+@@ -893,8 +956,7 @@ async def balance(ctx: Context, verbose):
+         print("")
+         for i, (k, v) in enumerate(unit_balances.items()):
+             unit = k
+-            print(
+-                f"Unit {i+1} ({unit}) - Balance: {unit.str(int(v['available']))}")
++            print(f"Unit {i+1} ({unit}) - Balance: {unit.str(int(v['available']))}")
+         print("")
+     if verbose:
+         # show balances per keyset
+@@ -1003,8 +1065,7 @@ async def send_command(
+     timelock: Optional[int],
+ ):
+     wallet: Wallet = ctx.obj["WALLET"]
+-    amount = int(
+-        amount * 100) if wallet.unit in [Unit.usd, Unit.eur] else int(amount)
++    amount = int(amount * 100) if wallet.unit in [Unit.usd, Unit.eur] else int(amount)
+     await send(
+         wallet,
+         amount=amount,
+@@ -1177,8 +1238,7 @@ async def pending(ctx: Context, legacy, number: int, offset: int):
+     reserved_proofs = await get_reserved_proofs(wallet.db)
+     if len(reserved_proofs):
+         print("--------------------------\n")
+-        sorted_proofs = sorted(reserved_proofs, key=itemgetter(
+-            "send_id"), reverse=True)  # type: ignore
++        sorted_proofs = sorted(reserved_proofs, key=itemgetter("send_id"), reverse=True)  # type: ignore
+         if number:
+             number += offset
+         for i, (key, value) in islice(
+@@ -1593,8 +1653,7 @@ async def info(ctx: Context, mint: bool, mnemonic: bool, reload: bool):
+                 if mint_info:
+                     print(f"        - Mint name: {mint_info['name']}")
+                     if mint_info.get("description"):
+-                        print(
+-                            f"        - Description: {mint_info['description']}")
++                        print(f"        - Description: {mint_info['description']}")
+                     if mint_info.get("description_long"):
+                         print(
+                             f"        - Long description: {mint_info['description_long']}"
+@@ -1606,8 +1665,7 @@ async def info(ctx: Context, mint: bool, mnemonic: bool, reload: bool):
+                     if mint_info.get("version"):
+                         print(f"        - Version: {mint_info['version']}")
+                     if mint_info.get("motd"):
+-                        print(
+-                            f"        - Message of the day: {mint_info['motd']}")
++                        print(f"        - Message of the day: {mint_info['motd']}")
+                     if mint_info.get("time"):
+                         print(f"        - Server time: {mint_info['time']}")
+                     if mint_info.get("nuts"):
+@@ -1751,8 +1809,7 @@ async def auth(ctx: Context, mint: bool, force: bool, password: bool):
+ 
+     if mint:
+         new_proofs = await auth_wallet.mint_blind_auth()
+-        print(
+-            f"Minted {auth_wallet.unit.str(sum_proofs(new_proofs))} auth tokens.")
++        print(f"Minted {auth_wallet.unit.str(sum_proofs(new_proofs))} auth tokens.")
+ 
+ 
+ @cli.group(cls=NaturalOrderGroup)
+diff --git a/cashu/wallet/crud.py b/cashu/wallet/crud.py
+index 9ceca743..ef694978 100644
+--- a/cashu/wallet/crud.py
++++ b/cashu/wallet/crud.py
+@@ -533,6 +533,149 @@ async def update_bolt11_melt_quote(
+     )
+ 
+ 
++async def store_payment_mint_quote(
++    db: Database, quote: MintQuote, conn: Optional[Connection] = None
++) -> None:
++    if quote.method == "bolt11":
++        await store_bolt11_mint_quote(db, quote, conn)
++        return
++    await (conn or db).execute(
++        """
++        INSERT INTO payment_mint_quotes
++            (quote, mint, method, request, checking_id, unit, amount, state,
++             created_time, paid_time, issued_time, expiry, privkey, pubkey,
++             amount_paid, amount_issued, updated_at, method_data)
++        VALUES (:quote, :mint, :method, :request, :checking_id, :unit, :amount,
++                :state, :created_time, :paid_time, :issued_time, :expiry,
++                :privkey, :pubkey, :amount_paid, :amount_issued, :updated_at,
++                :method_data)
++        """,
++        {
++            **quote.model_dump(),
++            "state": quote.state.value,
++            "method_data": json.dumps(quote.method_data),
++        },
++    )
++
++
++async def get_payment_mint_quote(
++    db: Database,
++    quote: str,
++    method: str = "bolt11",
++    conn: Optional[Connection] = None,
++) -> Optional[MintQuote]:
++    if method == "bolt11":
++        return await get_bolt11_mint_quote(db, quote=quote, conn=conn)
++    row = await (conn or db).fetchone(
++        "SELECT * FROM payment_mint_quotes WHERE quote = :quote AND method = :method",
++        {"quote": quote, "method": method},
++    )
++    return MintQuote.from_row(row) if row else None  # type: ignore[arg-type]
++
++
++async def update_payment_mint_quote(
++    db: Database, quote: MintQuote, conn: Optional[Connection] = None
++) -> None:
++    if quote.method == "bolt11":
++        await update_bolt11_mint_quote(
++            db,
++            quote.quote,
++            quote.state,
++            paid_time=quote.paid_time,
++            amount_paid=quote.amount_paid,
++            amount_issued=quote.amount_issued,
++            updated_at=quote.updated_at,
++            conn=conn,
++        )
++        return
++    await (conn or db).execute(
++        """
++        UPDATE payment_mint_quotes
++        SET state = :state, paid_time = :paid_time, issued_time = :issued_time,
++            amount_paid = :amount_paid, amount_issued = :amount_issued,
++            updated_at = :updated_at, method_data = :method_data
++        WHERE quote = :quote AND method = :method
++        """,
++        {
++            **quote.model_dump(),
++            "state": quote.state.value,
++            "method_data": json.dumps(quote.method_data),
++        },
++    )
++
++
++async def store_payment_melt_quote(
++    db: Database, quote: MeltQuote, conn: Optional[Connection] = None
++) -> None:
++    if quote.method == "bolt11":
++        await store_bolt11_melt_quote(db, quote, conn)
++        return
++    values = quote.model_dump()
++    values.update(
++        state=quote.state.value,
++        change=json.dumps([c.model_dump() for c in quote.change])
++        if quote.change
++        else "",
++        method_data=json.dumps(quote.method_data),
++    )
++    await (conn or db).execute(
++        """
++        INSERT INTO payment_melt_quotes
++            (quote, mint, method, request, checking_id, unit, amount, fee_reserve,
++             state, created_time, paid_time, fee_paid, payment_preimage, expiry,
++             change, method_data)
++        VALUES (:quote, :mint, :method, :request, :checking_id, :unit, :amount,
++                :fee_reserve, :state, :created_time, :paid_time, :fee_paid,
++                :payment_preimage, :expiry, :change, :method_data)
++        """,
++        values,
++    )
++
++
++async def get_payment_melt_quote(
++    db: Database,
++    quote: str,
++    method: str = "bolt11",
++    conn: Optional[Connection] = None,
++) -> Optional[MeltQuote]:
++    if method == "bolt11":
++        return await get_bolt11_melt_quote(db, quote=quote, conn=conn)
++    row = await (conn or db).fetchone(
++        "SELECT * FROM payment_melt_quotes WHERE quote = :quote AND method = :method",
++        {"quote": quote, "method": method},
++    )
++    return MeltQuote.from_row(row) if row else None  # type: ignore[arg-type]
++
++
++async def update_payment_melt_quote(
++    db: Database, quote: MeltQuote, conn: Optional[Connection] = None
++) -> None:
++    if quote.method == "bolt11":
++        await update_bolt11_melt_quote(
++            db,
++            quote.quote,
++            quote.state,
++            quote.paid_time or 0,
++            quote.fee_paid,
++            quote.payment_preimage or "",
++            conn,
++        )
++        return
++    await (conn or db).execute(
++        """
++        UPDATE payment_melt_quotes
++        SET state = :state, paid_time = :paid_time, fee_paid = :fee_paid,
++            payment_preimage = :payment_preimage, method_data = :method_data
++        WHERE quote = :quote AND method = :method
++        """,
++        {
++            **quote.model_dump(),
++            "state": quote.state.value,
++            "method_data": json.dumps(quote.method_data),
++        },
++    )
++
++
+ async def bump_secret_derivation(
+     db: Database,
+     keyset_id: str,
+diff --git a/cashu/wallet/migrations.py b/cashu/wallet/migrations.py
+index 35d54305..bc2acbf6 100644
+--- a/cashu/wallet/migrations.py
++++ b/cashu/wallet/migrations.py
+@@ -370,3 +370,54 @@ async def m019_add_p2pk_e_to_proofs(db: Database):
+     async with db.connect() as conn:
+         await conn.execute("ALTER TABLE proofs ADD COLUMN p2pk_e TEXT")
+         await conn.execute("ALTER TABLE proofs_used ADD COLUMN p2pk_e TEXT")
++
++
++async def m020_add_generic_payment_quote_tables(db: Database):
++    """Add quote storage for non-BOLT11 plugins without touching legacy tables."""
++    async with db.connect() as conn:
++        await conn.execute(
++            """
++            CREATE TABLE IF NOT EXISTS payment_mint_quotes (
++                quote TEXT PRIMARY KEY,
++                mint TEXT NOT NULL,
++                method TEXT NOT NULL,
++                request TEXT NOT NULL,
++                checking_id TEXT NOT NULL,
++                unit TEXT NOT NULL,
++                amount INTEGER NOT NULL,
++                state TEXT NOT NULL,
++                created_time INTEGER,
++                paid_time INTEGER,
++                issued_time INTEGER,
++                expiry INTEGER,
++                privkey TEXT,
++                pubkey TEXT,
++                amount_paid INTEGER,
++                amount_issued INTEGER,
++                updated_at INTEGER,
++                method_data TEXT
++            );
++            """
++        )
++        await conn.execute(
++            """
++            CREATE TABLE IF NOT EXISTS payment_melt_quotes (
++                quote TEXT PRIMARY KEY,
++                mint TEXT NOT NULL,
++                method TEXT NOT NULL,
++                request TEXT NOT NULL,
++                checking_id TEXT NOT NULL,
++                unit TEXT NOT NULL,
++                amount INTEGER NOT NULL,
++                fee_reserve INTEGER NOT NULL,
++                state TEXT NOT NULL,
++                created_time INTEGER,
++                paid_time INTEGER,
++                fee_paid INTEGER,
++                payment_preimage TEXT,
++                expiry INTEGER,
++                change TEXT,
++                method_data TEXT
++            );
++            """
++        )
+diff --git a/cashu/wallet/v1_api.py b/cashu/wallet/v1_api.py
+index 18089b5d..e127d23a 100644
+--- a/cashu/wallet/v1_api.py
++++ b/cashu/wallet/v1_api.py
+@@ -11,6 +11,7 @@ from ..core.base import (
+     AuthProof,
+     BlindedMessage,
+     BlindedSignature,
++    Method,
+     Proof,
+     Unit,
+     WalletKeyset,
+@@ -371,21 +372,43 @@ class LedgerAPI(SupportsAuth):
+         Raises:
+             Exception: If the mint request fails
+         """
+-        logger.trace("Requesting mint: POST /v1/mint/bolt11")
++        return await LedgerAPI.mint_quote_for_method(
++            self, Method.bolt11.name, amount, unit, memo=memo, pubkey=pubkey
++        )
++
++    @async_set_httpx_client
++    @async_ensure_mint_loaded
++    async def mint_quote_for_method(
++        self,
++        method: str,
++        amount: int,
++        unit: Unit,
++        memo: Optional[str] = None,
++        pubkey: Optional[str] = None,
++        method_options: Optional[dict] = None,
++    ) -> PostMintQuoteResponse:
++        """Request a mint quote for an explicitly selected payment method."""
++        logger.trace(f"Requesting mint: POST /v1/mint/quote/{method}")
+         payload = PostMintQuoteRequest(
+             unit=unit.name, amount=amount, description=memo, pubkey=pubkey
+         )
++        payload_dict = payload.model_dump()
++        if method_options:
++            payload_dict.update(method_options)
+         resp = await self._request(
+             POST,
+-            "mint/quote/bolt11",
+-            json=payload.model_dump(),
++            f"mint/quote/{method}",
++            json=payload_dict,
+         )
+ 
+         # if mint doesn't support v1 endpoint, fail explicitly
+-        self.raise_on_unsupported_version(resp, "POST /v1/mint/quote/bolt11")
++        self.raise_on_unsupported_version(resp, f"POST /v1/mint/quote/{method}")
+ 
+         return_dict = resp.json()
+-        return PostMintQuoteResponse.model_validate(return_dict)
++        quote_response = PostMintQuoteResponse.model_validate(return_dict)
++        if quote_response.method is not None and quote_response.method != method:
++            raise Exception("mint returned a quote for a different payment method")
++        return quote_response
+ 
+     @async_set_httpx_client
+     @async_ensure_mint_loaded
+@@ -398,10 +421,22 @@ class LedgerAPI(SupportsAuth):
+         Returns:
+             PostMintQuoteResponse: Mint Quote Response
+         """
+-        resp = await self._request(GET, f"mint/quote/bolt11/{quote}")
+-        self.raise_on_unsupported_version(resp, f"GET /v1/mint/quote/bolt11/{quote}")
++        return await LedgerAPI.get_mint_quote_for_method(
++            self, Method.bolt11.name, quote
++        )
++
++    @async_set_httpx_client
++    @async_ensure_mint_loaded
++    async def get_mint_quote_for_method(
++        self, method: str, quote: str
++    ) -> PostMintQuoteResponse:
++        resp = await self._request(GET, f"mint/quote/{method}/{quote}")
++        self.raise_on_unsupported_version(resp, f"GET /v1/mint/quote/{method}/{quote}")
+         return_dict = resp.json()
+-        return PostMintQuoteResponse.model_validate(return_dict)
++        quote_response = PostMintQuoteResponse.model_validate(return_dict)
++        if quote_response.method is not None and quote_response.method != method:
++            raise Exception("mint returned a quote for a different payment method")
++        return quote_response
+ 
+     @async_set_httpx_client
+     @async_ensure_mint_loaded
+@@ -421,6 +456,19 @@ class LedgerAPI(SupportsAuth):
+         Raises:
+             Exception: If the minting fails
+         """
++        return await LedgerAPI.mint_for_method(
++            self, Method.bolt11.name, outputs, quote, signature=signature
++        )
++
++    @async_set_httpx_client
++    @async_ensure_mint_loaded
++    async def mint_for_method(
++        self,
++        method: str,
++        outputs: List[BlindedMessage],
++        quote: str,
++        signature: Optional[str] = None,
++    ) -> List[BlindedSignature]:
+         outputs_payload = PostMintRequest(
+             outputs=outputs, quote=quote, signature=signature
+         )
+@@ -442,14 +490,14 @@ class LedgerAPI(SupportsAuth):
+         )  # type: ignore
+         resp = await self._request(
+             POST,
+-            "mint/bolt11",
++            f"mint/{method}",
+             json=payload,  # type: ignore
+         )
+ 
+         # fail explicitly if mint doesn't support v1 mint endpoint
+         self.raise_on_unsupported_version(resp, f"POST /v1/mint/{quote}")
+         response_dict = resp.json()
+-        logger.trace(f"Lightning invoice checked. POST {self.api_prefix}/mint/bolt11")
++        logger.trace(f"Payment checked. POST {self.api_prefix}/mint/{method}")
+         promises = PostMintResponse.model_validate(response_dict).signatures
+         return promises
+ 
+@@ -473,16 +521,33 @@ class LedgerAPI(SupportsAuth):
+             unit=unit.name, request=payment_request, options=melt_options
+         )
+ 
++        return await LedgerAPI.melt_quote_for_method(self, Method.bolt11.name, payload)
++
++    @async_set_httpx_client
++    @async_ensure_mint_loaded
++    async def melt_quote_for_method(
++        self,
++        method: str,
++        payload: PostMeltQuoteRequest,
++        method_options: Optional[dict] = None,
++    ) -> PostMeltQuoteResponse:
++        payload_dict = payload.model_dump()
++        if method_options:
++            payload_dict.update(method_options)
++
+         resp = await self._request(
+             POST,
+-            "melt/quote/bolt11",
+-            json=payload.model_dump(),
++            f"melt/quote/{method}",
++            json=payload_dict,
+         )
+ 
+         # if mint doesn't support v1 melt-quote endpoint, fail explicitly
+         self.raise_on_unsupported_version(resp, "POST /v1/melt/quote")
+         return_dict = resp.json()
+-        return PostMeltQuoteResponse.model_validate(return_dict)
++        quote_response = PostMeltQuoteResponse.model_validate(return_dict)
++        if quote_response.method is not None and quote_response.method != method:
++            raise Exception("mint returned a quote for a different payment method")
++        return quote_response
+ 
+     @async_set_httpx_client
+     @async_ensure_mint_loaded
+@@ -495,10 +560,22 @@ class LedgerAPI(SupportsAuth):
+         Returns:
+             PostMeltQuoteResponse: Melt Quote Response
+         """
+-        resp = await self._request(GET, f"melt/quote/bolt11/{quote}")
++        return await LedgerAPI.get_melt_quote_for_method(
++            self, Method.bolt11.name, quote
++        )
++
++    @async_set_httpx_client
++    @async_ensure_mint_loaded
++    async def get_melt_quote_for_method(
++        self, method: str, quote: str
++    ) -> PostMeltQuoteResponse:
++        resp = await self._request(GET, f"melt/quote/{method}/{quote}")
+         self.raise_on_error_request(resp)
+         return_dict = resp.json()
+-        return PostMeltQuoteResponse.model_validate(return_dict)
++        quote_response = PostMeltQuoteResponse.model_validate(return_dict)
++        if quote_response.method is not None and quote_response.method != method:
++            raise Exception("mint returned a quote for a different payment method")
++        return quote_response
+ 
+     @async_set_httpx_client
+     @async_ensure_mint_loaded
+@@ -513,6 +590,26 @@ class LedgerAPI(SupportsAuth):
+         Accepts proofs and a lightning invoice to pay in exchange.
+         """
+ 
++        return await LedgerAPI.melt_for_method(
++            self,
++            Method.bolt11.name,
++            quote,
++            proofs,
++            outputs,
++            prefer_async=prefer_async,
++        )
++
++    @async_set_httpx_client
++    @async_ensure_mint_loaded
++    async def melt_for_method(
++        self,
++        method: str,
++        quote: str,
++        proofs: List[Proof],
++        outputs: Optional[List[BlindedMessage]],
++        prefer_async: Optional[bool] = None,
++        method_options: Optional[dict] = None,
++    ) -> PostMeltQuoteResponse:
+         payload = PostMeltRequest(
+             quote=quote, inputs=proofs, outputs=outputs, prefer_async=prefer_async
+         )
+@@ -531,16 +628,22 @@ class LedgerAPI(SupportsAuth):
+                 include["outputs"] = {i: outputs_include for i in range(len(outputs))}
+             return include
+ 
++        payload_dict = payload.model_dump(
++            include=_meltrequest_include_fields(proofs, outputs)
++        )
++        if method_options:
++            payload_dict.update(method_options)
+         resp = await self._request(
+             POST,
+-            "melt/bolt11",
+-            json=payload.model_dump(
+-                include=_meltrequest_include_fields(proofs, outputs)
+-            ),  # type: ignore
++            f"melt/{method}",
++            json=payload_dict,
+             timeout=None,
+         )
+         self.raise_on_error_request(resp)
+-        return PostMeltQuoteResponse.model_validate(resp.json())
++        quote_response = PostMeltQuoteResponse.model_validate(resp.json())
++        if quote_response.method is not None and quote_response.method != method:
++            raise Exception("mint returned a quote for a different payment method")
++        return quote_response
+ 
+     @async_set_httpx_client
+     @async_ensure_mint_loaded
+diff --git a/cashu/wallet/wallet.py b/cashu/wallet/wallet.py
+index 51159796..68b265de 100644
+--- a/cashu/wallet/wallet.py
++++ b/cashu/wallet/wallet.py
+@@ -38,6 +38,7 @@ from ..core.migrations import migrate_databases
+ from ..core.mint_info import MintInfo
+ from ..core.models import (
+     PostCheckStateResponse,
++    PostMeltQuoteRequest,
+     PostMeltQuoteResponse,
+ )
+ from ..core.nuts import nut20
+@@ -52,6 +53,8 @@ from .crud import (
+     get_bolt11_mint_quote,
+     get_keysets,
+     get_mint_by_url,
++    get_payment_melt_quote,
++    get_payment_mint_quote,
+     get_proofs,
+     invalidate_proof,
+     secret_used,
+@@ -60,11 +63,15 @@ from .crud import (
+     store_bolt11_mint_quote,
+     store_keyset,
+     store_mint,
++    store_payment_melt_quote,
++    store_payment_mint_quote,
+     store_proof,
+     update_bolt11_melt_quote,
+     update_bolt11_mint_quote,
+     update_keyset,
+     update_mint,
++    update_payment_melt_quote,
++    update_payment_mint_quote,
+     update_proof,
+ )
+ from .errors import BalanceTooLowError
+@@ -584,6 +591,36 @@ class Wallet(
+         await store_bolt11_mint_quote(db=self.db, quote=quote)
+         return quote
+ 
++    async def request_mint_for_method(
++        self,
++        method: str,
++        amount: int,
++        memo: Optional[str] = None,
++        method_options: Optional[dict] = None,
++    ) -> MintQuote:
++        """Request and persist a mint quote for a selected payment method."""
++        active_keysets = [k for k in self.keysets.values() if k.active]
++        if not active_keysets:
++            await self.load_mint()
++            active_keysets = [k for k in self.keysets.values() if k.active]
++        if not active_keysets:
++            raise KeysetNotFoundError(
++                f"Cannot request mint quote: no active keysets found for unit {self.unit.name}."
++            )
++        privkey_hex, pubkey_hex = nut20.generate_keypair()
++        response = await super().mint_quote_for_method(
++            method,
++            amount,
++            self.unit,
++            memo=memo,
++            pubkey=pubkey_hex,
++            method_options=method_options,
++        )
++        quote = MintQuote.from_resp_wallet(response, self.url)
++        quote.privkey = privkey_hex
++        await store_payment_mint_quote(self.db, quote)
++        return quote
++
+     async def get_mint_quote(
+         self,
+         quote_id: str,
+@@ -633,11 +670,29 @@ class Wallet(
+ 
+         return mint_quote
+ 
++    async def get_mint_quote_for_method(self, method: str, quote_id: str) -> MintQuote:
++        response = await super().get_mint_quote_for_method(method, quote_id)
++        local = await get_payment_mint_quote(self.db, quote_id, method)
++        quote = MintQuote.check_stale_and_from_resp_wallet(
++            mint_quote_resp=response,
++            mint=self.url,
++            mint_quote_local=local,
++        )
++        if local and local.privkey:
++            quote.privkey = local.privkey
++        if local:
++            await update_payment_mint_quote(self.db, quote)
++        else:
++            await store_payment_mint_quote(self.db, quote)
++        return quote
++
+     async def mint(
+         self,
+         amount: int,
+         quote_id: str,
+         split: Optional[List[int]] = None,
++        *,
++        method: str = Method.bolt11.name,
+     ) -> List[Proof]:
+         """Mint tokens of a specific amount after an invoice has been paid.
+ 
+@@ -678,7 +733,7 @@ class Wallet(
+         await self._check_used_secrets(secrets)
+         outputs, rs = self._construct_outputs(amounts, secrets, rs)
+ 
+-        quote = await get_bolt11_mint_quote(db=self.db, quote=quote_id)
++        quote = await get_payment_mint_quote(db=self.db, quote=quote_id, method=method)
+         if not quote:
+             raise Exception("Quote not found.")
+         signature: str | None = None
+@@ -686,7 +741,7 @@ class Wallet(
+             signature = nut20.sign_mint_quote(quote_id, outputs, quote.privkey)
+ 
+         # will raise exception if mint is unsuccessful
+-        promises = await super().mint(outputs, quote_id, signature)
++        promises = await super().mint_for_method(method, outputs, quote_id, signature)
+ 
+         promises_keyset_id = promises[0].id
+         await bump_secret_derivation(
+@@ -694,15 +749,15 @@ class Wallet(
+         )
+         proofs = await self._construct_proofs(promises, secrets, rs, derivation_paths)
+ 
+-        await update_bolt11_mint_quote(
+-            db=self.db,
+-            quote=quote_id,
+-            state=MintQuoteState.issued,
+-            paid_time=int(time.time()),
+-            amount_paid=quote.amount,
+-            amount_issued=quote.amount,
+-            updated_at=int(time.time()),
++        quote.amount_issued = (quote.amount_issued or 0) + amount
++        quote.state_val = (
++            MintQuoteState.issued
++            if quote.amount_issued == quote.amount_paid
++            else MintQuoteState.paid
+         )
++        quote.paid_time = quote.paid_time or int(time.time())
++        quote.updated_at = int(time.time())
++        await update_payment_mint_quote(self.db, quote)
+         # store the mint_id in proofs
+         async with self.db.connect() as conn:
+             for p in proofs:
+@@ -710,6 +765,15 @@ class Wallet(
+                 await update_proof(p, mint_id=quote_id, conn=conn)
+         return proofs
+ 
++    async def mint_for_method(
++        self,
++        method: str,
++        amount: int,
++        quote_id: str,
++        split: Optional[List[int]] = None,
++    ) -> List[Proof]:
++        return await self.mint(amount, quote_id, split=split, method=method)
++
+     async def redeem(
+         self,
+         proofs: List[Proof],
+@@ -777,9 +841,9 @@ class Wallet(
+                 send_outputs, keep_outputs, secret_lock
+             )
+ 
+-        assert len(secrets) == len(amounts), (
+-            "number of secrets does not match number of outputs"
+-        )
++        assert len(secrets) == len(
++            amounts
++        ), "number of secrets does not match number of outputs"
+         # verify that we didn't accidentally reuse a secret
+         await self._check_used_secrets(secrets)
+ 
+@@ -841,6 +905,20 @@ class Wallet(
+         await store_bolt11_melt_quote(db=self.db, quote=melt_quote)
+         return melt_quote
+ 
++    async def melt_quote_for_method(
++        self,
++        method: str,
++        request: str,
++        method_options: Optional[dict] = None,
++    ) -> MeltQuote:
++        payload = PostMeltQuoteRequest(unit=self.unit.name, request=request)
++        response = await super().melt_quote_for_method(
++            method, payload, method_options=method_options
++        )
++        quote = MeltQuote.from_resp_wallet(response, self.url)
++        await store_payment_melt_quote(self.db, quote)
++        return quote
++
+     async def get_melt_quote(self, quote: str) -> Optional[MeltQuote]:
+         """Fetches a melt quote from the mint and updates proofs in the database.
+ 
+@@ -886,6 +964,25 @@ class Wallet(
+                 await self.set_reserved_for_melt(proofs, reserved=False, quote_id=None)
+         return melt_quote
+ 
++    async def get_melt_quote_for_method(
++        self, method: str, quote_id: str
++    ) -> Optional[MeltQuote]:
++        response = await super().get_melt_quote_for_method(method, quote_id)
++        local = await get_payment_melt_quote(self.db, quote_id, method)
++        quote = MeltQuote.from_resp_wallet(response, self.url)
++        proofs = await get_proofs(db=self.db, melt_id=quote_id)
++        if local:
++            await update_payment_melt_quote(self.db, quote)
++        else:
++            await store_payment_melt_quote(self.db, quote)
++        if quote.state == MeltQuoteState.paid and (
++            not local or local.state != MeltQuoteState.paid
++        ):
++            await self.invalidate(proofs)
++        elif quote.state == MeltQuoteState.unpaid:
++            await self.set_reserved_for_melt(proofs, reserved=False, quote_id=None)
++        return quote
++
+     async def melt(
+         self,
+         proofs: List[Proof],
+@@ -893,6 +990,9 @@ class Wallet(
+         fee_reserve_sat: int,
+         quote_id: str,
+         prefer_async: Optional[bool] = None,
++        *,
++        method: str = Method.bolt11.name,
++        method_options: Optional[dict] = None,
+     ) -> PostMeltQuoteResponse:
+         """Pays a lightning invoice and returns the status of the payment.
+ 
+@@ -922,8 +1022,13 @@ class Wallet(
+         await self.set_reserved_for_melt(proofs, reserved=True, quote_id=quote_id)
+         proofs = self.sign_proofs_inplace_melt(proofs, change_outputs, quote_id)
+         try:
+-            melt_quote_resp = await super().melt(
+-                quote_id, proofs, change_outputs, prefer_async=prefer_async
++            melt_quote_resp = await super().melt_for_method(
++                method,
++                quote_id,
++                proofs,
++                change_outputs,
++                prefer_async=prefer_async,
++                method_options=method_options,
+             )
+         except Exception as e:
+             logger.debug(f"Mint error: {e}")
+@@ -952,14 +1057,9 @@ class Wallet(
+         if melt_quote.change:
+             fee_paid -= sum_promises(melt_quote.change)
+ 
+-        await update_bolt11_melt_quote(
+-            db=self.db,
+-            quote=quote_id,
+-            state=MeltQuoteState.paid,
+-            paid_time=int(time.time()),
+-            payment_preimage=melt_quote.payment_preimage or "",
+-            fee_paid=fee_paid,
+-        )
++        melt_quote.fee_paid = fee_paid
++        melt_quote.paid_time = int(time.time())
++        await update_payment_melt_quote(self.db, melt_quote)
+ 
+         # handle change and produce proofs
+         if melt_quote.change:
+@@ -972,6 +1072,26 @@ class Wallet(
+             logger.debug(f"Received change: {self.unit.str(sum_proofs(change_proofs))}")
+         return melt_quote_resp
+ 
++    async def melt_for_method(
++        self,
++        method: str,
++        proofs: List[Proof],
++        request: str,
++        fee_reserve: int,
++        quote_id: str,
++        prefer_async: Optional[bool] = None,
++        method_options: Optional[dict] = None,
++    ) -> PostMeltQuoteResponse:
++        return await self.melt(
++            proofs,
++            request,
++            fee_reserve,
++            quote_id,
++            prefer_async,
++            method=method,
++            method_options=method_options,
++        )
++
+     async def check_proof_state(self, proofs) -> PostCheckStateResponse:
+         return await super().check_proof_state(proofs)
+ 
+@@ -1001,9 +1121,9 @@ class Wallet(
+                 return
+             logger.trace("Verifying DLEQ proof.")
+             assert proof.id
+-            assert proof.id in self.keysets, (
+-                f"Keyset {proof.id} not known, can not verify DLEQ."
+-            )
++            assert (
++                proof.id in self.keysets
++            ), f"Keyset {proof.id} not known, can not verify DLEQ."
+             if not b_dhke.carol_verify_dleq(
+                 secret_msg=proof.secret,
+                 C=PublicKey(bytes.fromhex(proof.C)),
+@@ -1107,9 +1227,9 @@ class Wallet(
+         Raises:
+             AssertionError: if len(amounts) != len(secrets)
+         """
+-        assert len(amounts) == len(secrets), (
+-            f"len(amounts)={len(amounts)} not equal to len(secrets)={len(secrets)}"
+-        )
++        assert len(amounts) == len(
++            secrets
++        ), f"len(amounts)={len(amounts)} not equal to len(secrets)={len(secrets)}"
+         keyset_id = keyset_id or self.keyset_id
+         outputs: List[BlindedMessage] = []
+         rs_ = [None] * len(amounts) if not rs else rs

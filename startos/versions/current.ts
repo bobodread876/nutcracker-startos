@@ -1,28 +1,13 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.20.3:1',
+  version: '0.22.1:2',
   releaseNotes: {
-    en_US: `Updates Nutshell to 0.20.3, adding P2BK support, asynchronous melts, batched minting, accounting improvements and reliability fixes. This release migrates the mint database — take a fresh backup before updating, because downgrading afterward is not supported. The mint also no longer fails to start while Core Lightning issues a replacement rune, which happens when you run its Revoke Runes action.
-
-- Advanced Settings' Log Level explains each of its options.
-- Mint Info's description and contact fields say that they are published in your mint's public info.`,
-    es_ES: `Actualiza Nutshell a 0.20.3, añadiendo compatibilidad con P2BK, canjes asíncronos, emisión por lotes, mejoras de contabilidad y correcciones de fiabilidad. Esta versión migra la base de datos de la casa de moneda: haz una copia de seguridad nueva antes de actualizar, porque después no se admite volver a una versión anterior. Además, la casa de moneda ya no falla al iniciarse mientras Core Lightning emite una runa de reemplazo, lo que ocurre al ejecutar su acción Revocar runas.
-
-- El campo Nivel de registro de Ajustes avanzados explica cada una de sus opciones.
-- Los campos de descripción y de contacto de Información de la casa de moneda indican que se publican en su información pública.`,
-    de_DE: `Aktualisiert Nutshell auf 0.20.3 mit P2BK-Unterstützung, asynchronen Einlösungen, gebündelter Prägung, verbesserter Abrechnung und Zuverlässigkeitskorrekturen. Diese Version migriert die Mint-Datenbank – erstelle vorher eine neue Sicherung, denn ein anschließendes Downgrade wird nicht unterstützt. Außerdem schlägt der Mint nicht mehr beim Start fehl, während Core Lightning eine Ersatz-Rune erzeugt, was beim Ausführen seiner Aktion „Runen widerrufen“ geschieht.
-
-- Die Protokollstufe in den Erweiterten Einstellungen erklärt jede ihrer Optionen.
-- Die Beschreibungs- und Kontaktfelder der Mint-Informationen sagen, dass sie in den öffentlichen Infos deines Mints veröffentlicht werden.`,
-    pl_PL: `Aktualizuje Nutshell do 0.20.3, dodając obsługę P2BK, asynchroniczne wykupy, wsadową emisję, ulepszenia księgowania i poprawki niezawodności. Ta wersja migruje bazę danych mennicy — przed aktualizacją zrób nową kopię zapasową, ponieważ późniejszy powrót do starszej wersji nie jest obsługiwany. Mennica nie kończy się już też błędem przy starcie, gdy Core Lightning tworzy nową runę, co następuje po uruchomieniu jego akcji „Unieważnij runy”.
-
-- Pole Poziom logowania w Ustawieniach zaawansowanych objaśnia każdą ze swoich opcji.
-- Pola opisu i kontaktu w Informacjach o mennicy informują, że są publikowane w informacjach publicznych Twojej mennicy.`,
-    fr_FR: `Met Nutshell à jour vers 0.20.3, avec la prise en charge P2BK, les rachats asynchrones, la frappe par lots, des améliorations comptables et des correctifs de fiabilité. Cette version migre la base de données du mint : faites une nouvelle sauvegarde avant de mettre à jour, car le retour à une version antérieure n'est ensuite pas pris en charge. Le mint ne démarre plus en échec pendant que Core Lightning crée une rune de remplacement, ce qui se produit lorsque vous exécutez son action « Révoquer les runes ».
-
-- Le champ Niveau de journalisation des Paramètres avancés explique chacune de ses options.
-- Les champs de description et de contact des Informations du mint indiquent qu'ils sont publiés dans les informations publiques de votre mint.`,
+    en_US: `First Nutcracker release: Nutshell 0.22.1 with Lightning through phoenixd, and onchain deposits and withdrawals (NUT-30) you can switch on in Onchain Settings. Onchain reads the chain from your Fulcrum server and keeps deposits in a hot wallet that sweeps into phoenixd. A read-only admin dashboard shows balances, quotes, keysets and health; run Set Admin Password to sign in.`,
+    es_ES: `Primera versión de Nutcracker: Nutshell 0.22.1 con Lightning a través de phoenixd, y depósitos y retiros onchain (NUT-30) que puedes activar en Ajustes onchain. Onchain lee la cadena desde tu servidor Fulcrum y guarda los depósitos en una cartera caliente que se barre a phoenixd. Un panel de administración de solo lectura muestra saldos, cotizaciones, keysets y estado; ejecuta Establecer contraseña de administración para iniciar sesión.`,
+    de_DE: `Erste Nutcracker-Version: Nutshell 0.22.1 mit Lightning über phoenixd sowie Onchain-Einzahlungen und -Auszahlungen (NUT-30), die du in den Onchain-Einstellungen einschalten kannst. Onchain liest die Blockchain von deinem Fulcrum-Server und hält Einzahlungen in einer Hot Wallet, die zu phoenixd übertragen wird. Ein schreibgeschütztes Admin-Dashboard zeigt Salden, Angebote, Keysets und Zustand; führe „Admin-Passwort festlegen“ aus, um dich anzumelden.`,
+    pl_PL: `Pierwsze wydanie Nutcracker: Nutshell 0.22.1 z Lightning przez phoenixd oraz wpłatami i wypłatami onchain (NUT-30), które możesz włączyć w Ustawieniach onchain. Onchain odczytuje łańcuch z Twojego serwera Fulcrum i trzyma wpłaty w gorącym portfelu, który jest przelewany do phoenixd. Panel administracyjny tylko do odczytu pokazuje salda, wyceny, keysety i stan; uruchom Ustaw hasło administratora, aby się zalogować.`,
+    fr_FR: `Première version de Nutcracker : Nutshell 0.22.1 avec Lightning via phoenixd, et des dépôts et retraits onchain (NUT-30) à activer dans les Paramètres onchain. Onchain lit la chaîne depuis votre serveur Fulcrum et garde les dépôts dans un portefeuille chaud transféré vers phoenixd. Un tableau de bord d'administration en lecture seule affiche soldes, devis, keysets et état ; lancez Définir le mot de passe d'administration pour vous connecter.`,
   },
   migrations: {
     up: async ({ effects }) => {},

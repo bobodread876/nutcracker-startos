@@ -1,0 +1,430 @@
+From: Nutcracker <bobodread876@users.noreply.github.com>
+Subject: [PATCH] phoenixd Lightning backend (PhoenixdWallet)
+
+Retires when: an upstream Nutshell release includes a phoenixd Lightning backend.
+Generated from the nutcracker/0.22.1 branch of Nutshell (see UPDATING.md), commits 6222fdf8..28fcd226
+
+---
+ cashu/core/settings.py      |   6 +
+ cashu/lightning/__init__.py |   1 +
+ cashu/lightning/phoenixd.py | 376 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 383 insertions(+)
+
+diff --git a/cashu/core/settings.py b/cashu/core/settings.py
+index 8ab636a3..b562e40c 100644
+--- a/cashu/core/settings.py
++++ b/cashu/core/settings.py
+@@ -337,6 +337,11 @@ class CLNRestFundingSource(MintSettings):
+     mint_clnrest_enable_mpp: bool = Field(default=True)
+ 
+ 
++class PhoenixdFundingSource(MintSettings):
++    mint_phoenixd_url: str = Field(default="http://127.0.0.1:9740")
++    mint_phoenixd_api_password: Optional[str] = Field(default=None)
++
++
+ class AuthSettings(MintSettings):
+     mint_auth_database: str = Field(default="data/mint")
+     mint_auth_private_key: Optional[str] = Field(default=None)
+@@ -375,6 +380,7 @@ class Settings(
+     LndRPCFundingSource,
+     LndRestFundingSource,
+     CLNRestFundingSource,
++    PhoenixdFundingSource,
+     FakeWalletSettings,
+     MintLimits,
+     MintBackends,
+diff --git a/cashu/lightning/__init__.py b/cashu/lightning/__init__.py
+index b735d811..bea62bb3 100644
+--- a/cashu/lightning/__init__.py
++++ b/cashu/lightning/__init__.py
+@@ -4,6 +4,7 @@ from .clnrest import CLNRestWallet  # noqa: F401
+ from .fake import FakeWallet  # noqa: F401
+ from .lnd_grpc.lnd_grpc import LndRPCWallet  # noqa: F401
+ from .lndrest import LndRestWallet  # noqa: F401
++from .phoenixd import PhoenixdWallet  # noqa: F401
+ from .sparkl2 import SparkL2Wallet  # noqa: F401
+ from .strike import StrikeWallet  # noqa: F401
+ 
+diff --git a/cashu/lightning/phoenixd.py b/cashu/lightning/phoenixd.py
+new file mode 100644
+index 00000000..39012101
+--- /dev/null
++++ b/cashu/lightning/phoenixd.py
+@@ -0,0 +1,376 @@
++import json
++import math
++import os
++import time
++from typing import AsyncGenerator, Optional
++
++import bolt11 as bolt11lib
++import httpx
++from loguru import logger
++
++from ..core.base import Amount, MeltQuote, Unit
++from ..core.errors import AmountlessInvoiceNotSupportedError, QuoteExpiredError
++from ..core.models import PostMeltQuoteRequest
++from ..core.settings import settings
++from .base import (
++    InvoiceResponse,
++    LightningBackend,
++    PaymentQuoteResponse,
++    PaymentResponse,
++    PaymentResult,
++    PaymentStatus,
++    PaymentStatusResult,
++    StatusResponse,
++)
++
++# phoenixd keeps no record of a /payinvoice request it rejected up front (4xx:
++# unparsable invoice, bad amount, ...), so /payments/outgoingbyhash later says
++# "not found" and Nutshell leaves the melt PENDING with the user's proofs locked
++# (only a definitive FAILED rolls a melt back). Such rejections are remembered
++# here so the status check can answer FAILED. Only never-sent requests qualify.
++PHOENIXD_FAILED_SENDS_FILE = os.environ.get(
++    "MINT_PHOENIXD_FAILED_SENDS_FILE",
++    os.path.join(settings.cashu_dir, "phoenixd-failed-sends.jsonl"),
++)
++
++
++class PhoenixdWallet(LightningBackend):
++    """phoenixd (ACINQ) SAT backend for the Nutshell mint.
++
++    phoenixd exposes a small HTTP API (basic auth, empty username +
++    http-password); this maps it onto the Nutshell LightningBackend interface.
++
++    Config (.env):
++        MINT_BACKEND_BOLT11_SAT=PhoenixdWallet
++        MINT_PHOENIXD_URL=http://127.0.0.1:9740        # localhost if colocated
++        MINT_PHOENIXD_API_PASSWORD=<http-password>     # FULL cred (needs pay)
++
++    Endpoints used:
++        GET  /getbalance                         -> {balanceSat, feeCreditSat}
++        POST /createinvoice                      -> {amountSat, paymentHash, serialized}
++        POST /payinvoice                         -> {paymentHash, paymentPreimage, routingFeeSat}
++        GET  /payments/incoming/{paymentHash}    -> {isPaid, isExpired, receivedSat, ...}
++        GET  /payments/outgoing/byhash/{hash}    -> {isPaid, preimage, fees, ...}
++
++    checking_id convention: the bolt11 payment hash (hex), for both incoming
++    (mint quotes) and outgoing (melt quotes), so status is re-checkable by hash.
++    """
++
++    supported_units = {Unit.sat}
++    supports_description: bool = True
++    unit = Unit.sat
++
++    def __init__(self, unit: Unit = Unit.sat, **kwargs):
++        self.assert_unit_supported(unit)
++        self.unit = unit
++
++        self.endpoint = getattr(
++            settings, "mint_phoenixd_url", "http://127.0.0.1:9740"
++        ).rstrip("/")
++        password = settings.mint_phoenixd_api_password
++        assert password, "MINT_PHOENIXD_API_PASSWORD not set"
++
++        # phoenixd uses HTTP basic auth: empty username, http-password as password.
++        self.client = httpx.AsyncClient(auth=("", password), timeout=40)
++        self._ws_password = password
++        self._failed_sends: set = set()
++        self._load_failed_sends()
++
++    # ------------------------------------------------ definitive send failures
++    def _load_failed_sends(self) -> None:
++        try:
++            with open(PHOENIXD_FAILED_SENDS_FILE) as fh:
++                for line in fh:
++                    line = line.strip()
++                    if not line:
++                        continue
++                    try:
++                        cid = json.loads(line).get("checking_id")
++                    except ValueError:
++                        cid = line
++                    if cid:
++                        self._failed_sends.add(cid.lower())
++        except FileNotFoundError:
++            pass
++        except Exception as exc:
++            logger.warning(f"PhoenixdWallet: could not read failed-sends file: {exc}")
++        if self._failed_sends:
++            logger.info(
++                f"PhoenixdWallet: {len(self._failed_sends)} recorded failed send(s)"
++            )
++
++    def _record_failed_send(self, payment_hash: str, quote_id: str, error: str) -> None:
++        self._failed_sends.add(payment_hash.lower())
++        try:
++            with open(PHOENIXD_FAILED_SENDS_FILE, "a") as fh:
++                fh.write(
++                    json.dumps(
++                        {
++                            "checking_id": payment_hash.lower(),
++                            "quote": quote_id,
++                            "error": error[:300],
++                            "ts": int(time.time()),
++                        }
++                    )
++                    + "\n"
++                )
++        except Exception as exc:
++            logger.error(f"PhoenixdWallet: could not persist failed send: {exc}")
++
++    # ------------------------------------------------------------------ status
++    def validate_payment_request(self, request: str) -> int:
++        # Nutshell 0.22: validate the bolt11 locally at melt-quote creation and
++        # return its absolute expiry (no network calls), as the upstream backends do.
++        invoice = bolt11lib.decode(request)
++        if not invoice.amount_msat:
++            raise AmountlessInvoiceNotSupportedError("invoice has no amount.")
++        if invoice.has_expired():
++            raise QuoteExpiredError("invoice expired")
++        return invoice.expiry_time
++
++    async def status(self) -> StatusResponse:
++        try:
++            r = await self.client.get(f"{self.endpoint}/getbalance")
++            r.raise_for_status()
++            data = r.json()
++        except Exception as exc:
++            return StatusResponse(
++                error_message=f"phoenixd API error: {exc}",
++                balance=Amount(self.unit, 0),
++            )
++        return StatusResponse(balance=Amount(Unit.sat, int(data.get("balanceSat", 0))))
++
++    # ------------------------------------------------------------ create invoice
++    async def create_invoice(
++        self,
++        amount: Amount,
++        memo: Optional[str] = None,
++        description_hash: Optional[bytes] = None,
++        unhashed_description: Optional[bytes] = None,
++    ) -> InvoiceResponse:
++        self.assert_unit_supported(amount.unit)
++        sats = amount.to(Unit.sat).amount
++
++        data = {"amountSat": sats, "externalId": "cashu-mint"}
++        if description_hash:
++            data["descriptionHash"] = description_hash.hex()
++        else:
++            data["description"] = memo or ""
++
++        try:
++            r = await self.client.post(f"{self.endpoint}/createinvoice", data=data)
++            r.raise_for_status()
++            resp = r.json()
++        except Exception as exc:
++            logger.error(f"PhoenixdWallet create_invoice error: {exc}")
++            return InvoiceResponse(ok=False, error_message=str(exc))
++
++        payment_hash = resp.get("paymentHash")
++        serialized = resp.get("serialized")
++        if not payment_hash or not serialized:
++            return InvoiceResponse(
++                ok=False, error_message=f"phoenixd bad createinvoice response: {resp}"
++            )
++        return InvoiceResponse(
++            ok=True, checking_id=payment_hash, payment_request=serialized
++        )
++
++    # --------------------------------------------------------------- pay invoice
++    async def pay_invoice(
++        self, quote: MeltQuote, fee_limit_msat: int
++    ) -> PaymentResponse:
++        # Derive the payment hash up front so a timeout is still re-checkable.
++        payment_hash = None
++        amountless = False
++        try:
++            decoded = bolt11lib.decode(quote.request)
++            payment_hash = decoded.payment_hash
++            amountless = not decoded.amount_msat
++        except Exception:
++            pass
++
++        data = {"invoice": quote.request}
++        if amountless:
++            # amountless invoice: phoenixd needs an explicit amount
++            data["amountSat"] = str(quote.amount)
++
++        try:
++            r = await self.client.post(f"{self.endpoint}/payinvoice", data=data)
++        except httpx.TimeoutException:
++            # phoenixd /payinvoice blocks until settled; on timeout it may still
++            # be in flight. Report PENDING so the mint re-checks by hash rather
++            # than double-spending or failing a paid melt.
++            logger.warning("PhoenixdWallet pay_invoice timeout; reporting PENDING")
++            return PaymentResponse(
++                result=PaymentResult.PENDING, checking_id=payment_hash
++            )
++        except Exception as exc:
++            logger.error(f"PhoenixdWallet pay_invoice error: {exc}")
++            return PaymentResponse(
++                result=PaymentResult.ERROR,
++                checking_id=payment_hash,
++                error_message=str(exc),
++            )
++
++        try:
++            resp = r.json()
++        except Exception:
++            resp = {}
++
++        # Success is signalled by a returned preimage.
++        preimage = resp.get("paymentPreimage")
++        if r.status_code == 200 and preimage:
++            fee_sat = int(resp.get("routingFeeSat", 0) or 0)
++            return PaymentResponse(
++                result=PaymentResult.SETTLED,
++                checking_id=resp.get("paymentHash") or payment_hash,
++                fee=Amount(Unit.sat, fee_sat),
++                preimage=preimage,
++            )
++
++        # No preimage -> failure. phoenixd returns a reason string on 4xx.
++        reason = resp.get("reason") or resp.get("message") or r.text or "unknown error"
++        logger.error(f"PhoenixdWallet pay_invoice failed ({r.status_code}): {reason}")
++        if r.status_code >= 500:
++            # phoenixd choked mid-request: unknown whether an attempt was
++            # made. Let the status check by hash decide.
++            return PaymentResponse(
++                result=PaymentResult.ERROR,
++                checking_id=payment_hash,
++                error_message=str(reason),
++            )
++        if 400 <= r.status_code < 500 and payment_hash:
++            # Rejected before any attempt: phoenixd will never have a record
++            # for this hash, so remember it as a definitive failure.
++            self._record_failed_send(payment_hash, quote.quote, str(reason))
++        return PaymentResponse(
++            result=PaymentResult.FAILED,
++            checking_id=payment_hash,
++            error_message=str(reason),
++        )
++
++    # --------------------------------------------------------------- status: in
++    async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
++        """checking_id = payment hash of a mint (incoming) invoice."""
++        try:
++            r = await self.client.get(
++                f"{self.endpoint}/payments/incoming/{checking_id}"
++            )
++            if r.status_code == 404:
++                return PaymentStatus(result=PaymentStatusResult.NOT_FOUND)
++            r.raise_for_status()
++            data = r.json()
++        except Exception as exc:
++            return PaymentStatus(result=PaymentStatusResult.ERROR, error_message=str(exc))
++
++        if data.get("isPaid"):
++            return PaymentStatus(
++                result=PaymentStatusResult.SETTLED, preimage=data.get("preimage")
++            )
++        if data.get("isExpired"):
++            return PaymentStatus(result=PaymentStatusResult.FAILED)
++        return PaymentStatus(result=PaymentStatusResult.PENDING)
++
++    # -------------------------------------------------------------- status: out
++    async def get_payment_status(self, checking_id: str) -> PaymentStatus:
++        """checking_id = payment hash of a melt (outgoing) payment."""
++        # phoenixd route is /payments/outgoingbyhash/{hash} (NOT outgoing/byhash).
++        # It returns the best attempt for that hash (Succeeded > Pending > Failed),
++        # 404 "Not found" (0.9.x) or 204 No Content (newer) when nothing was recorded.
++        try:
++            r = await self.client.get(
++                f"{self.endpoint}/payments/outgoingbyhash/{checking_id}"
++            )
++            if r.status_code in (404, 204):
++                # phoenixd never recorded an attempt. If we saw phoenixd reject
++                # the request up front, that is a definitive failure; otherwise
++                # the ledger keeps the quote pending (re-checkable).
++                if (checking_id or "").lower() in self._failed_sends:
++                    return PaymentStatus(
++                        result=PaymentStatusResult.FAILED,
++                        error_message="phoenixd rejected the payment request before sending",
++                    )
++                return PaymentStatus(result=PaymentStatusResult.NOT_FOUND)
++            r.raise_for_status()
++            data = r.json()
++        except Exception as exc:
++            return PaymentStatus(result=PaymentStatusResult.ERROR, error_message=str(exc))
++
++        # ApiType.OutgoingPayment: isPaid = status is Succeeded; completedAt is set
++        # for Succeeded and Failed only (null while Pending); fees are MILLIsats.
++        if data.get("isPaid"):
++            fee_msat = int(data.get("fees", 0) or 0)
++            return PaymentStatus(
++                result=PaymentStatusResult.SETTLED,
++                fee=Amount(Unit.sat, math.ceil(fee_msat / 1000)),
++                preimage=data.get("preimage"),
++            )
++        if data.get("completedAt"):
++            return PaymentStatus(
++                result=PaymentStatusResult.FAILED,
++                error_message="phoenixd: outgoing payment failed",
++            )
++        return PaymentStatus(result=PaymentStatusResult.PENDING)
++
++    # ---------------------------------------------------------------- fee quote
++    async def get_payment_quote(
++        self, melt_quote: PostMeltQuoteRequest
++    ) -> PaymentQuoteResponse:
++        try:
++            decoded = bolt11lib.decode(melt_quote.request)
++            amount_msat = decoded.amount_msat or 0
++            payment_hash = decoded.payment_hash
++        except Exception:
++            amount_msat = 0
++            payment_hash = melt_quote.request
++
++        amount_sat = math.ceil(amount_msat / 1000)
++        # Same reserve rule as the other backends: a percentage of the amount
++        # with a floor, both from LIGHTNING_FEE_PERCENT / LIGHTNING_RESERVE_FEE_MIN.
++        fee_msat = max(
++            amount_msat * settings.lightning_fee_percent / 100,
++            settings.lightning_reserve_fee_min,
++        )
++        fee_sat = math.ceil(fee_msat / 1000)
++        return PaymentQuoteResponse(
++            checking_id=payment_hash,
++            amount=Amount(Unit.sat, amount_sat),
++            fee=Amount(Unit.sat, fee_sat),
++        )
++
++    # ------------------------------------------------------------------ stream
++    supports_incoming_payment_stream: bool = True
++
++    async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
++        """phoenixd's /websocket pushes a payment_received event the moment an
++        invoice is paid; yield its payment hash (the mint quote checking_id) so
++        the quote flips to PAID without waiting for the wallet's next poll.
++        Only invoices this backend created (externalId cashu-mint) are yielded.
++        The ledger's invoice_listener restarts the stream with backoff if the
++        socket drops; wallet polling keeps working as a fallback."""
++        import base64
++        import json as _json
++
++        import websockets
++
++        url = self.endpoint.replace("https://", "wss://").replace("http://", "ws://") + "/websocket"
++        auth = base64.b64encode(f":{self._ws_password}".encode()).decode()
++        async with websockets.connect(
++            url, extra_headers={"Authorization": f"Basic {auth}"},
++            ping_interval=20, ping_timeout=20, open_timeout=10,
++        ) as ws:
++            logger.info("PhoenixdWallet: incoming payment stream connected")
++            async for raw in ws:
++                try:
++                    msg = _json.loads(raw)
++                except ValueError:
++                    continue
++                if not isinstance(msg, dict) or msg.get("type") != "payment_received":
++                    continue
++                phash = (msg.get("paymentHash") or "").lower()
++                if not phash:
++                    continue
++                if msg.get("externalId") not in (None, "cashu-mint"):
++                    continue
++                logger.info(f"PhoenixdWallet: payment received {phash[:16]} ({msg.get('amountSat')} sat)")
++                yield phash
