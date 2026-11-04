@@ -1,0 +1,1047 @@
+From: Nutcracker <bobodread876@users.noreply.github.com>
+Subject: [PATCH] onchain via phoenixd: splice-out payouts, Electrum chain source, deposit wallet swept into phoenixd; 0.22 melt-flow fixes
+
+Retires when: an upstream Nutshell release includes phoenixd onchain payouts and deposits.
+Generated from the nutcracker/0.22.1 branch of Nutshell (see UPDATING.md), commits 6b5d7222..3d0b2ff8
+
+---
+ cashu/core/models/mint_quote.py   |   9 +-
+ cashu/mint/db/write.py            |  20 +-
+ cashu/mint/ledger.py              |  13 +-
+ cashu/payment/chain.py            | 268 +++++++++++++++++++++++
+ cashu/payment/onchain.py          |  88 ++++++--
+ cashu/payment/onchain_phoenixd.py | 437 ++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 809 insertions(+), 26 deletions(-)
+
+diff --git a/cashu/core/models/mint_quote.py b/cashu/core/models/mint_quote.py
+index 44de0b77..234775f8 100644
+--- a/cashu/core/models/mint_quote.py
++++ b/cashu/core/models/mint_quote.py
+@@ -1,6 +1,6 @@
+ from typing import Annotated, List, Optional
+ 
+-from pydantic import BaseModel, ConfigDict, Field
++from pydantic import BaseModel, ConfigDict, Field, model_validator
+ 
+ from cashu.core.base import MintQuote
+ from cashu.core.constants import (
+@@ -46,6 +46,13 @@ class PostMintQuoteResponse(BaseModel):
+     expiry: Optional[int] = None  # expiry of the quote
+     pubkey: Optional[str] = None  # NUT-20 quote lock pubkey
+ 
++    @model_validator(mode="after")
++    def _bolt11_has_amount(self) -> "PostMintQuoteResponse":
++        # Only reusable requests (NUT-30 onchain) omit the fixed amount.
++        if self.method == "bolt11" and self.amount is None:
++            raise ValueError("bolt11 mint quotes must include an amount")
++        return self
++
+     @classmethod
+     def from_mint_quote(cls, mint_quote: MintQuote) -> "PostMintQuoteResponse":
+         # Build the public wire object explicitly. MintQuote also contains internal
+diff --git a/cashu/mint/db/write.py b/cashu/mint/db/write.py
+index f363ee0d..3c193649 100644
+--- a/cashu/mint/db/write.py
++++ b/cashu/mint/db/write.py
+@@ -631,11 +631,15 @@ class DbWriteHelper:
+             melt_quote.state = state
+             await self.crud.update_melt_quote(quote=melt_quote, db=self.db, conn=conn)
+ 
+-    async def _store_melt_quote(self, quote: MeltQuote):
++    async def _store_melt_quote(
++        self, quote: MeltQuote, allow_repeated_request: bool = False
++    ):
+         """Stores a melt quote in the database. Will fail if a quote with the same checking_id is already pending or paid.
+ 
+         Args:
+             quote (MeltQuote): Melt quote to store.
++            allow_repeated_request: Skip the check for methods whose requests may
++                be paid more than once (e.g. a reused onchain address).
+ 
+         Raises:
+             TransactionError: If a quote with the same checking_id is already pending or paid.
+@@ -660,10 +664,16 @@ class DbWriteHelper:
+             quotes_by_request = await self.crud.get_melt_quotes_by_request(
+                 request=quote.request, db=self.db, conn=conn
+             )
+-            quotes_db = {
+-                existing.quote: existing
+-                for existing in quotes_by_checking_id + quotes_by_request
+-            }.values()
++            quotes_db = (
++                []
++                if allow_repeated_request
++                else list(
++                    {
++                        existing.quote: existing
++                        for existing in quotes_by_checking_id + quotes_by_request
++                    }.values()
++                )
++            )
+             if any([quote.state == MeltQuoteState.paid for quote in quotes_db]):
+                 raise InvoiceAlreadyPaidError("Melt quote already paid or pending.")
+             if any([quote.state == MeltQuoteState.pending for quote in quotes_db]):
+diff --git a/cashu/mint/ledger.py b/cashu/mint/ledger.py
+index f4de87ec..c0902674 100644
+--- a/cashu/mint/ledger.py
++++ b/cashu/mint/ledger.py
+@@ -686,6 +686,8 @@ class Ledger(
+         method_name = self._method_name(method)
+         plugin = payment_method_registry.get(method_name)
+         backend = self._get_backend(method, unit)
++        if not plugin.settings_for(backend, unit).mint_enabled:
++            raise NotAllowedError(f"Minting with {method_name} is disabled.")
+ 
+         if quote_request.description and not plugin.supports_description(backend):
+             raise NotAllowedError("Backend does not support descriptions.")
+@@ -708,7 +710,10 @@ class Ledger(
+             raise LightningError("could not fetch payment request from backend")
+ 
+         quote_amount = invoice_response.amount or Amount(unit, quote_request.amount)
+-        if quote_amount.unit != unit or quote_amount.amount <= 0:
++        # Reusable requests (NUT-30 onchain) have no fixed amount.
++        if quote_amount.unit != unit or (
++            not plugin.allows_partial_mint and quote_amount.amount <= 0
++        ):
+             raise LightningError("backend returned an invalid mint quote amount")
+         if (
+             method_name == Method.bolt11.name
+@@ -1213,6 +1218,8 @@ class Ledger(
+         method_name = self._method_name(method)
+         plugin = payment_method_registry.get(method_name)
+         backend = self._get_backend(method, unit)
++        if not plugin.settings_for(backend, unit).melt_enabled:
++            raise NotAllowedError(f"Melting with {method_name} is disabled.")
+ 
+         request = plugin.canonicalize_request(melt_quote.request)
+ 
+@@ -1275,7 +1282,9 @@ class Ledger(
+             expiry=expiry,
+             method_data=payment_quote.model_extra or {},
+         )
+-        await self.db_write._store_melt_quote(quote)
++        await self.db_write._store_melt_quote(
++            quote, allow_repeated_request=plugin.allows_repeated_melt_requests
++        )
+         await self.events.submit(quote)
+ 
+         return PostMeltQuoteResponse.from_melt_quote(quote)
+diff --git a/cashu/payment/chain.py b/cashu/payment/chain.py
+new file mode 100644
+index 00000000..6730eddb
+--- /dev/null
++++ b/cashu/payment/chain.py
+@@ -0,0 +1,268 @@
++"""Chain data for onchain backends: fee estimates, tip height, confirmations.
++
++Two sources are supported. Electrum talks to an Electrum server such as Fulcrum or
++electrs (optionally through a SOCKS5 proxy, e.g. Tor), so an operator can rely on
++their own node. Esplora talks to an Esplora HTTP API such as mempool.space.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import json
++import socket
++import ssl
++import struct
++from typing import Any, Optional, Protocol
++from urllib.parse import urlparse
++
++import bdkpython as bdk
++import httpx
++
++NETWORKS = {
++    "bitcoin": bdk.Network.BITCOIN,
++    "mainnet": bdk.Network.BITCOIN,
++    "testnet": bdk.Network.TESTNET,
++    "signet": bdk.Network.SIGNET,
++    "regtest": bdk.Network.REGTEST,
++}
++
++
++def parse_network(name: Any) -> bdk.Network:
++    key = str(name).lower()
++    if key not in NETWORKS:
++        raise ValueError(f"unknown network '{name}'")
++    return NETWORKS[key]
++
++
++def script_bytes(address: str, network: bdk.Network) -> bytes:
++    return bytes(bdk.Address(address, network).script_pubkey().to_bytes())
++
++
++class ChainSource(Protocol):
++    async def fee_rate(self, target_blocks: int) -> Optional[float]:
++        """Estimated sat/vB to confirm within ``target_blocks``, if known."""
++
++    async def tip_height(self) -> int: ...
++
++    async def tx_outputs(self, txid: str) -> Optional[list[tuple[bytes, int]]]:
++        """(scriptPubKey, value) per output, or None if the tx is unknown."""
++
++    async def confirmation_height(self, txid: str, script: bytes) -> Optional[int]:
++        """Block height of ``txid``, or None while unconfirmed."""
++
++
++class EsploraChain:
++    def __init__(self, url: str, timeout: float = 15) -> None:
++        self._client = httpx.AsyncClient(base_url=url.rstrip("/"), timeout=timeout)
++        self._estimates: Optional[dict[int, float]] = None
++
++    async def fee_rate(self, target_blocks: int) -> Optional[float]:
++        r = await self._client.get("/fee-estimates")
++        r.raise_for_status()
++        estimates = {int(k): float(v) for k, v in r.json().items()}
++        # Esplora omits some targets; use the nearest faster one available.
++        faster = [t for t in estimates if t <= target_blocks]
++        return estimates[max(faster)] if faster else None
++
++    async def tip_height(self) -> int:
++        r = await self._client.get("/blocks/tip/height")
++        r.raise_for_status()
++        return int(r.text)
++
++    async def _tx(self, txid: str) -> Optional[dict[str, Any]]:
++        r = await self._client.get(f"/tx/{txid}")
++        if r.status_code == 404:
++            return None
++        r.raise_for_status()
++        return r.json()
++
++    async def tx_outputs(self, txid: str) -> Optional[list[tuple[bytes, int]]]:
++        tx = await self._tx(txid)
++        if tx is None:
++            return None
++        return [
++            (bytes.fromhex(out["scriptpubkey"]), int(out["value"]))
++            for out in tx.get("vout", [])
++        ]
++
++    async def confirmation_height(self, txid: str, script: bytes) -> Optional[int]:
++        tx = await self._tx(txid)
++        status = (tx or {}).get("status", {})
++        return int(status["block_height"]) if status.get("confirmed") else None
++
++
++class ElectrumError(Exception):
++    pass
++
++
++class ElectrumChain:
++    """Minimal Electrum protocol client (JSON-RPC over TCP or TLS).
++
++    ``url`` is ``tcp://host:port`` or ``ssl://host:port``. ``socks5`` is an optional
++    ``host:port`` proxy; hostnames (including .onion) are resolved by the proxy.
++    Each call opens a short-lived connection, which keeps the client stateless and
++    tolerant of Tor circuit changes.
++    """
++
++    def __init__(
++        self,
++        url: str,
++        socks5: Optional[str] = None,
++        validate_domain: bool = True,
++        timeout: float = 30,
++    ) -> None:
++        parsed = urlparse(url)
++        if (
++            parsed.scheme not in ("tcp", "ssl")
++            or not parsed.hostname
++            or not parsed.port
++        ):
++            raise ValueError(
++                "electrum url must look like ssl://host:port or tcp://host:port"
++            )
++        self.host = parsed.hostname
++        self.port = parsed.port
++        self.use_ssl = parsed.scheme == "ssl"
++        self.socks5: Optional[tuple[str, int]] = None
++        if socks5:
++            host, _, port = socks5.rpartition(":")
++            self.socks5 = (host, int(port))
++        self.validate_domain = validate_domain
++        self.timeout = timeout
++
++    @staticmethod
++    def socks5_connect_request(host: str, port: int) -> bytes:
++        encoded = host.encode()
++        if len(encoded) > 255:
++            raise ValueError("hostname too long for SOCKS5")
++        return (
++            b"\x05\x01\x00\x03"
++            + bytes([len(encoded)])
++            + encoded
++            + struct.pack(">H", port)
++        )
++
++    @staticmethod
++    def _recv_exact(sock: socket.socket, n: int) -> bytes:
++        data = b""
++        while len(data) < n:
++            chunk = sock.recv(n - len(data))
++            if not chunk:
++                raise ElectrumError("connection closed during SOCKS5 handshake")
++            data += chunk
++        return data
++
++    def _socks5_handshake(self, sock: socket.socket) -> None:
++        sock.sendall(b"\x05\x01\x00")  # version 5, one method: no authentication
++        if self._recv_exact(sock, 2) != b"\x05\x00":
++            raise ElectrumError("SOCKS5 proxy refused no-auth method")
++        sock.sendall(self.socks5_connect_request(self.host, self.port))
++        version, reply, _, atyp = self._recv_exact(sock, 4)
++        if version != 5 or reply != 0:
++            raise ElectrumError(f"SOCKS5 connect failed with code {reply}")
++        # Skip the bound address the proxy reports.
++        if atyp == 1:
++            self._recv_exact(sock, 4 + 2)
++        elif atyp == 4:
++            self._recv_exact(sock, 16 + 2)
++        elif atyp == 3:
++            self._recv_exact(sock, self._recv_exact(sock, 1)[0] + 2)
++        else:
++            raise ElectrumError(f"SOCKS5 proxy returned unknown address type {atyp}")
++
++    def _open(self) -> socket.socket:
++        target = self.socks5 or (self.host, self.port)
++        sock = socket.create_connection(target, timeout=self.timeout)
++        try:
++            if self.socks5:
++                self._socks5_handshake(sock)
++            if self.use_ssl:
++                context = ssl.create_default_context()
++                if not self.validate_domain:
++                    context.check_hostname = False
++                    context.verify_mode = ssl.CERT_NONE
++                sock = context.wrap_socket(sock, server_hostname=self.host)
++            return sock
++        except Exception:
++            sock.close()
++            raise
++
++    def _call_sync(self, calls: list[tuple[str, list[Any]]]) -> list[Any]:
++        with self._open() as sock:
++            payload = b"".join(
++                json.dumps(
++                    {"jsonrpc": "2.0", "id": i, "method": m, "params": p}
++                ).encode()
++                + b"\n"
++                for i, (m, p) in enumerate(calls)
++            )
++            sock.sendall(payload)
++            results: dict[int, Any] = {}
++            buffer = b""
++            while len(results) < len(calls):
++                chunk = sock.recv(65536)
++                if not chunk:
++                    raise ElectrumError("electrum server closed the connection")
++                buffer += chunk
++                while b"\n" in buffer:
++                    line, buffer = buffer.split(b"\n", 1)
++                    if not line.strip():
++                        continue
++                    message = json.loads(line)
++                    if "id" not in message or message["id"] is None:
++                        continue  # subscription notification
++                    results[int(message["id"])] = message
++        out = []
++        for i in range(len(calls)):
++            message = results[i]
++            if message.get("error"):
++                raise ElectrumError(str(message["error"]))
++            out.append(message.get("result"))
++        return out
++
++    async def call(self, method: str, *params: Any) -> Any:
++        return (await asyncio.to_thread(self._call_sync, [(method, list(params))]))[0]
++
++    async def fee_rate(self, target_blocks: int) -> Optional[float]:
++        btc_per_kvb = await self.call("blockchain.estimatefee", target_blocks)
++        if btc_per_kvb is None or float(btc_per_kvb) <= 0:
++            return None
++        return float(btc_per_kvb) * 1e8 / 1000
++
++    async def tip_height(self) -> int:
++        header = await self.call("blockchain.headers.subscribe")
++        return int(header["height"])
++
++    async def tx_outputs(self, txid: str) -> Optional[list[tuple[bytes, int]]]:
++        try:
++            raw = await self.call("blockchain.transaction.get", txid, False)
++        except ElectrumError:
++            return None
++        tx = bdk.Transaction(list(bytes.fromhex(raw)))
++        return [(bytes(o.script_pubkey.to_bytes()), int(o.value)) for o in tx.output()]
++
++    @staticmethod
++    def scripthash(script: bytes) -> str:
++        return hashlib.sha256(script).digest()[::-1].hex()
++
++    async def confirmation_height(self, txid: str, script: bytes) -> Optional[int]:
++        history = await self.call(
++            "blockchain.scripthash.get_history", self.scripthash(script)
++        )
++        for entry in history or []:
++            if entry.get("tx_hash") == txid and int(entry.get("height", 0)) > 0:
++                return int(entry["height"])
++        return None
++
++
++def chain_source_from_config(config: dict[str, Any]) -> ChainSource:
++    """``electrum_url`` (with optional ``socks5`` and ``validate_domain``) wins over
++    ``esplora_url``; Esplora at mempool.space is the default."""
++    if config.get("electrum_url"):
++        return ElectrumChain(
++            str(config["electrum_url"]),
++            socks5=config.get("socks5"),
++            validate_domain=bool(config.get("validate_domain", True)),
++        )
++    return EsploraChain(str(config.get("esplora_url", "https://mempool.space/api")))
+diff --git a/cashu/payment/onchain.py b/cashu/payment/onchain.py
+index a3478ffc..fae5cd6a 100644
+--- a/cashu/payment/onchain.py
++++ b/cashu/payment/onchain.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ import asyncio
+ import time
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any, AsyncGenerator, Optional
+ 
+ import bdkpython as bdk
+ from pydantic import BaseModel, ConfigDict, Field
+@@ -20,6 +20,8 @@ from ..lightning.base import (
+     StatusResponse,
+ )
+ from .base import PaymentMethodPlugin, PaymentMethodSettings
++from .chain import parse_network
++from .onchain_phoenixd import PhoenixdOnchainBackend, SendFailed
+ 
+ 
+ class OnchainMintQuoteRequest(BaseModel):
+@@ -38,12 +40,14 @@ class OnchainMeltQuoteRequest(PostMeltQuoteRequest):
+ 
+ 
+ class BdkOnchainBackend:
+-    """Persistent BIP84 BDK wallet synchronized through Bitcoin Core RPC."""
++    """Persistent BIP84 BDK wallet synchronized through Bitcoin Core RPC or Electrum."""
+ 
+     def __init__(self, unit: Unit, config: dict[str, Any]) -> None:
+         if unit != Unit.sat:
+             raise ValueError("the onchain backend currently supports only sat")
+         self.unit = unit
++        # Regtest stays the default so a mainnet wallet is always an explicit choice.
++        self.network = parse_network(config.get("network", "regtest"))
+         self.confirmations = int(config.get("confirmations", 1))
+         self.min_amount = int(config.get("min_amount", 1))
+         self.fee_target = int(config.get("fee_target", 1))
+@@ -63,31 +67,44 @@ class BdkOnchainBackend:
+         )
+         database_path.parent.mkdir(parents=True, exist_ok=True)
+         secret = bdk.DescriptorSecretKey(
+-            bdk.Network.REGTEST, bdk.Mnemonic.from_string(str(mnemonic)), None
++            self.network, bdk.Mnemonic.from_string(str(mnemonic)), None
+         )
+         external = bdk.Descriptor.new_bip84(
+-            secret, bdk.KeychainKind.EXTERNAL, bdk.Network.REGTEST
++            secret, bdk.KeychainKind.EXTERNAL, self.network
+         )
+         internal = bdk.Descriptor.new_bip84(
+-            secret, bdk.KeychainKind.INTERNAL, bdk.Network.REGTEST
++            secret, bdk.KeychainKind.INTERNAL, self.network
+         )
+         self._wallet = bdk.Wallet(
+             external,
+             internal,
+-            bdk.Network.REGTEST,
++            self.network,
+             bdk.DatabaseConfig.SQLITE(
+                 bdk.SqliteDbConfiguration(path=str(database_path))
+             ),
+         )
+-        self._blockchain = bdk.Blockchain(
+-            bdk.BlockchainConfig.RPC(
++        if config.get("electrum_url"):
++            # An Electrum server such as Fulcrum or electrs, optionally through a
++            # SOCKS5 proxy (e.g. Tor) so the mint can use the operator's own node.
++            blockchain_config = bdk.BlockchainConfig.ELECTRUM(
++                bdk.ElectrumConfig(
++                    url=str(config["electrum_url"]),
++                    socks5=config.get("socks5"),
++                    retry=int(config.get("electrum_retry", 3)),
++                    timeout=int(config.get("electrum_timeout", 30)),
++                    stop_gap=int(config.get("stop_gap", 100)),
++                    validate_domain=bool(config.get("validate_domain", True)),
++                )
++            )
++        else:
++            blockchain_config = bdk.BlockchainConfig.RPC(
+                 bdk.RpcConfig(
+                     url=str(config.get("rpc_url", "http://127.0.0.1:18443")),
+                     auth=bdk.Auth.USER_PASS(
+                         str(config.get("rpc_user", "cashu")),
+                         str(config.get("rpc_password", "cashu")),
+                     ),
+-                    network=bdk.Network.REGTEST,
++                    network=self.network,
+                     wallet_name=wallet_name,
+                     sync_params=bdk.RpcSyncParams(
+                         start_script_count=int(config.get("start_script_count", 100)),
+@@ -97,11 +114,18 @@ class BdkOnchainBackend:
+                     ),
+                 )
+             )
+-        )
++        self._blockchain = bdk.Blockchain(blockchain_config)
+         self._lock = asyncio.Lock()
+-
+-    def _sync(self) -> None:
++        # Seconds between wallet syncs; 0 syncs on every call. A remote or Tor
++        # Electrum server makes each sync cost seconds, so operators may raise it.
++        self.min_sync_interval = float(config.get("min_sync_interval", 0))
++        self._last_sync = 0.0
++
++    def _sync(self, force: bool = False) -> None:
++        if not force and time.monotonic() - self._last_sync < self.min_sync_interval:
++            return
+         self._wallet.sync(self._blockchain, None)
++        self._last_sync = time.monotonic()
+ 
+     @staticmethod
+     def _is_confirmed(
+@@ -127,7 +151,7 @@ class BdkOnchainBackend:
+         return info.address.as_string()
+ 
+     async def received(self, address: str) -> int:
+-        target = bdk.Address(address, bdk.Network.REGTEST).script_pubkey().to_bytes()
++        target = bdk.Address(address, self.network).script_pubkey().to_bytes()
+         async with self._lock:
+             await asyncio.to_thread(self._sync)
+             height = await asyncio.to_thread(self._blockchain.get_height)
+@@ -145,7 +169,7 @@ class BdkOnchainBackend:
+     async def fee_quote(
+         self, address: str, amount: int
+     ) -> tuple[int, list[dict[str, int]]]:
+-        bdk.Address(address, bdk.Network.REGTEST)
++        bdk.Address(address, self.network)
+         try:
+             sat_vb = (
+                 await asyncio.to_thread(self._blockchain.estimate_fee, self.fee_target)
+@@ -166,7 +190,7 @@ class BdkOnchainBackend:
+         ]
+ 
+     async def send(self, address: str, amount: int) -> tuple[str, int, str]:
+-        destination = bdk.Address(address, bdk.Network.REGTEST).script_pubkey()
++        destination = bdk.Address(address, self.network).script_pubkey()
+         async with self._lock:
+             await asyncio.to_thread(self._sync)
+             try:
+@@ -233,8 +257,22 @@ class OnchainPaymentMethod(PaymentMethodPlugin):
+     allows_repeated_melt_requests = True
+     supports_mint_quote_expiry = False
+ 
+-    def create_backend(self, unit: Unit, config: dict[str, Any]) -> BdkOnchainBackend:
+-        return BdkOnchainBackend(unit, config)
++    def create_backend(
++        self, unit: Unit, config: dict[str, Any]
++    ) -> BdkOnchainBackend | PhoenixdOnchainBackend:
++        kind = str(config.get("backend", "bdk"))
++        if kind == "bdk":
++            return BdkOnchainBackend(unit, config)
++        if kind == "phoenixd":
++            return PhoenixdOnchainBackend(unit, config)
++        raise ValueError(f"unknown onchain backend '{kind}'")
++
++    def supports_incoming_payment_stream(self, backend: Any) -> bool:
++        return isinstance(backend, PhoenixdOnchainBackend) and backend.supports_mint
++
++    async def incoming_payment_stream(self, backend: Any) -> AsyncGenerator[str, None]:
++        async for checking_id in backend.background_loop():
++            yield checking_id
+ 
+     def settings_for(
+         self, backend: BdkOnchainBackend, unit: Unit
+@@ -242,7 +280,9 @@ class OnchainPaymentMethod(PaymentMethodPlugin):
+         return PaymentMethodSettings(
+             method_name=self.method,
+             min_amount=backend.min_amount,
++            max_amount=getattr(backend, "max_amount", None),
+             options={"confirmations": backend.confirmations},
++            mint_enabled=getattr(backend, "supports_mint", True),
+         )
+ 
+     async def create_incoming_payment(
+@@ -283,6 +323,15 @@ class OnchainPaymentMethod(PaymentMethodPlugin):
+     async def execute_outgoing_payment(
+         self, backend: BdkOnchainBackend, quote: MeltQuote, fee_limit: Amount
+     ) -> PaymentResponse:
++        if isinstance(backend, PhoenixdOnchainBackend):
++            try:
++                txid = await backend.send(quote, fee_limit.amount)
++            except SendFailed as exc:
++                return PaymentResponse(
++                    result=PaymentResult.FAILED, error_message=str(exc)
++                )
++            # The outpoint and our fee share are known once Esplora sees the tx.
++            return PaymentResponse(result=PaymentResult.PENDING, checking_id=txid)
+         txid, fee, outpoint = await backend.send(quote.request, quote.amount)
+         return PaymentResponse(
+             result=PaymentResult.PENDING,
+@@ -295,7 +344,10 @@ class OnchainPaymentMethod(PaymentMethodPlugin):
+     async def get_outgoing_payment_status(
+         self, backend: BdkOnchainBackend, quote: MeltQuote
+     ) -> PaymentStatus:
+-        status = await backend.transaction_status(quote.checking_id)
++        if isinstance(backend, PhoenixdOnchainBackend):
++            status = await backend.payment_status(quote)
++        else:
++            status = await backend.transaction_status(quote.checking_id)
+         if status.fee and status.fee.amount > quote.fee_reserve:
+             status.fee = Amount(Unit.sat, quote.fee_reserve)
+         return status
+diff --git a/cashu/payment/onchain_phoenixd.py b/cashu/payment/onchain_phoenixd.py
+new file mode 100644
+index 00000000..ef31bcf3
+--- /dev/null
++++ b/cashu/payment/onchain_phoenixd.py
+@@ -0,0 +1,437 @@
++from __future__ import annotations
++
++import asyncio
++import json
++import math
++import os
++import re
++import time
++from pathlib import Path
++from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
++
++import bdkpython as bdk
++import httpx
++from loguru import logger
++
++from ..core.base import Amount, MeltQuote, Unit
++from ..lightning.base import PaymentStatus, PaymentStatusResult, StatusResponse
++from .chain import chain_source_from_config, parse_network, script_bytes
++
++if TYPE_CHECKING:
++    from .onchain import BdkOnchainBackend
++
++# Settings a deposit wallet inherits from the backend unless it sets its own.
++SHARED_WALLET_KEYS = (
++    "network",
++    "confirmations",
++    "electrum_url",
++    "socks5",
++    "validate_domain",
++)
++
++TXID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
++
++
++class SendFailed(Exception):
++    """phoenixd answered and the splice-out was not created."""
++
++
++class PhoenixdOnchainBackend:
++    """Melt-only NUT-30 backend that pays out by splicing out of a phoenixd channel.
++
++    phoenixd exposes a single reusable swap-in address, so it cannot hand out the
++    per-quote deposit addresses NUT-30 minting needs. Payouts use ``sendtoaddress``,
++    which splices the amount out of the channel. phoenixd reports neither fee
++    estimates nor confirmation depth, so both come from a chain source: an Electrum
++    server such as the operator's own Fulcrum, or an Esplora API.
++    """
++
++    deposits: Optional[BdkOnchainBackend] = None
++
++    def __init__(self, unit: Unit, config: dict[str, Any]) -> None:
++        if unit != Unit.sat:
++            raise ValueError("the phoenixd onchain backend supports only sat")
++        self.unit = unit
++        self.network = parse_network(config.get("network", "bitcoin"))
++        self.confirmations = int(config.get("confirmations", 1))
++        self.min_amount = int(config.get("min_amount", 10_000))
++        max_amount = config.get("max_amount")
++        self.max_amount = int(max_amount) if max_amount is not None else None
++        # Our share of a splice-out: the shared channel input and output plus the
++        # destination output. Overestimating only raises the reserve; the user is
++        # charged the fee phoenixd reports, capped at the reserve.
++        self.splice_vbytes = int(config.get("splice_vbytes", 300))
++        self.fee_targets = [int(t) for t in config.get("fee_targets", [2, 6, 144])]
++        self.min_fee_rate = int(config.get("min_fee_rate", 1))
++
++        password = config.get("password")
++        password_file = config.get("password_file")
++        if password_file:
++            password = self._read_password(Path(str(password_file)))
++        if not password:
++            raise ValueError(
++                "phoenixd onchain backend requires password or password_file"
++            )
++        self._phoenixd = httpx.AsyncClient(
++            base_url=str(config.get("endpoint", "http://127.0.0.1:9740")),
++            auth=("", str(password)),
++            timeout=float(config.get("timeout", 60)),
++        )
++        self.chain = chain_source_from_config(config)
++        self._lock = asyncio.Lock()
++        # Quotes whose send phoenixd explicitly refused in this process. Only these
++        # may be reported FAILED when no splice-out is found for them.
++        self._refused: set[str] = set()
++
++        # Optional deposit wallet: a BDK wallet hands out per-quote deposit
++        # addresses, and its confirmed coins are swept into phoenixd's swap-in
++        # address so they end up in the channel that pays users out.
++        deposit_config = config.get("deposit_wallet")
++        if deposit_config:
++            from .onchain import BdkOnchainBackend
++
++            inherited = {k: config[k] for k in SHARED_WALLET_KEYS if k in config}
++            inherited.setdefault("network", "bitcoin")
++            self.deposits = BdkOnchainBackend(unit, {**inherited, **deposit_config})
++        self.sweep_threshold = int(config.get("sweep_threshold", 500_000))
++        self.sweep_max_age = int(config.get("sweep_max_age", 86_400))
++        self.sweep_min = int(config.get("sweep_min", 50_000))
++        self.sweep_fee_target = int(config.get("sweep_fee_target", 144))
++        self.poll_interval = float(config.get("poll_interval", 60))
++        status_file = config.get("status_file")
++        self.status_file = Path(str(status_file)) if status_file else None
++        self.last_sweep: Optional[dict[str, Any]] = None
++
++    @property
++    def supports_mint(self) -> bool:
++        return self.deposits is not None
++
++    @staticmethod
++    def _read_password(path: Path) -> str:
++        """Accept either a bare password or phoenix.conf (``http-password=...``)."""
++        text = path.read_text().strip()
++        for line in text.splitlines():
++            key, sep, value = line.partition("=")
++            if sep and key.strip() == "http-password":
++                return value.strip()
++        return text
++
++    def validate_address(self, address: str) -> None:
++        try:
++            bdk.Address(address, self.network)
++        except Exception as exc:
++            raise ValueError(f"invalid bitcoin address: {exc}") from exc
++
++    async def status(self) -> StatusResponse:
++        try:
++            r = await self._phoenixd.get("/getbalance")
++            r.raise_for_status()
++            return StatusResponse(balance=Amount(Unit.sat, int(r.json()["balanceSat"])))
++        except Exception as exc:
++            return StatusResponse(balance=Amount(Unit.sat, 0), error_message=str(exc))
++
++    async def new_address(self) -> str:
++        if self.deposits is None:
++            raise NotImplementedError(
++                "phoenixd cannot issue per-quote deposit addresses; configure deposit_wallet"
++            )
++        return await self.deposits.new_address()
++
++    async def received(self, address: str) -> int:
++        if self.deposits is None:
++            raise NotImplementedError("onchain minting needs a deposit_wallet")
++        return await self.deposits.received(address)
++
++    async def _swap_in_address(self) -> str:
++        r = await self._phoenixd.get("/getswapinaddress")
++        r.raise_for_status()
++        address = str(r.json()["address"])
++        self.validate_address(address)
++        return address
++
++    def _confirmed_utxos(self, wallet: Any, height: int) -> list[Any]:
++        """Unspent deposit outputs with at least ``confirmations`` confirmations."""
++        heights = {
++            tx.txid: tx.confirmation_time.height
++            for tx in wallet.list_transactions(False)
++            if tx.confirmation_time is not None
++        }
++        return [
++            utxo
++            for utxo in wallet.list_unspent()
++            if not utxo.is_spent
++            and utxo.outpoint.txid in heights
++            and height - heights[utxo.outpoint.txid] + 1 >= self.confirmations
++        ]
++
++    async def maybe_sweep(self, now: Optional[float] = None) -> Optional[str]:
++        """Sweep confirmed deposits into phoenixd when the threshold or age rule fires.
++
++        Sweeps when the confirmed deposit balance reaches ``sweep_threshold``, or
++        when it is at least ``sweep_min`` and its oldest coin has waited
++        ``sweep_max_age`` seconds. Waits while an earlier sweep is unconfirmed.
++        Returns the sweep txid, or None if nothing was swept.
++        """
++        deposits = self.deposits
++        if deposits is None:
++            return None
++        now = time.time() if now is None else now
++        async with deposits._lock:
++            wallet = deposits._wallet
++            await asyncio.to_thread(deposits._sync, True)
++            height = await asyncio.to_thread(deposits._blockchain.get_height)
++            transactions = await asyncio.to_thread(wallet.list_transactions, False)
++            if any(tx.sent > 0 and tx.confirmation_time is None for tx in transactions):
++                return None
++            utxos = await asyncio.to_thread(self._confirmed_utxos, wallet, height)
++            total = sum(int(u.txout.value) for u in utxos)
++            times = {
++                tx.txid: tx.confirmation_time.timestamp
++                for tx in transactions
++                if tx.confirmation_time is not None
++            }
++            oldest = min((times[u.outpoint.txid] for u in utxos), default=now)
++            due = total >= self.sweep_threshold or (
++                total >= self.sweep_min and now - oldest >= self.sweep_max_age
++            )
++            if not due:
++                return None
++
++            destination = await self._swap_in_address()
++            rate = await self.chain.fee_rate(self.sweep_fee_target)
++            fee_rate = float(max(self.min_fee_rate, math.ceil(rate or 0)))
++            script = bdk.Address(destination, self.network).script_pubkey()
++            builder = (
++                bdk.TxBuilder()
++                .add_utxos([u.outpoint for u in utxos])
++                .manually_selected_only()
++                .drain_to(script)
++                .fee_rate(fee_rate)
++                .enable_rbf()
++            )
++            result = await asyncio.to_thread(builder.finish, wallet)
++            if not await asyncio.to_thread(wallet.sign, result.psbt, None):
++                raise RuntimeError("could not sign deposit sweep")
++            transaction = result.psbt.extract_tx()
++            await asyncio.to_thread(deposits._blockchain.broadcast, transaction)
++            txid = transaction.txid()
++            # Sync right away so the swept coins stop counting as deposits.
++            await asyncio.to_thread(deposits._sync, True)
++        fee = result.transaction_details.fee or 0
++        self.last_sweep = {
++            "txid": txid,
++            "amount_sat": total - fee,
++            "fee_sat": fee,
++            "inputs": len(utxos),
++            "address": destination,
++            "time": int(now),
++        }
++        logger.info(
++            f"Swept {total} sat of deposits into phoenixd swap-in {destination}: {txid} (fee {fee} sat)"
++        )
++        return txid
++
++    async def deposit_balance(self) -> dict[str, int]:
++        if self.deposits is None:
++            return {}
++        async with self.deposits._lock:
++            balance = await asyncio.to_thread(self.deposits._wallet.get_balance)
++        return {
++            "confirmed_sat": int(balance.confirmed),
++            "pending_sat": int(balance.trusted_pending + balance.untrusted_pending),
++        }
++
++    async def write_status(self) -> None:
++        """Publish deposit-wallet and swap-in balances for an external reserves monitor."""
++        if self.status_file is None:
++            return
++        r = await self._phoenixd.get("/getbalance")
++        r.raise_for_status()
++        status = {
++            "updated": int(time.time()),
++            "deposit_wallet": await self.deposit_balance(),
++            "phoenixd_swap_in": r.json().get("swapIn"),
++            "last_sweep": self.last_sweep,
++        }
++        tmp = self.status_file.with_suffix(".tmp")
++        tmp.write_text(json.dumps(status, indent=2))
++        os.replace(tmp, self.status_file)
++
++    async def background_loop(self) -> AsyncGenerator[str, None]:
++        """Periodic deposit sync, sweep and status publication.
++
++        Shaped as the ledger's incoming-payment stream so it runs under the same
++        supervised, auto-restarting listener task. It never yields.
++        """
++        while True:
++            try:
++                await self.maybe_sweep()
++            except Exception as exc:
++                logger.error(f"deposit sweep failed: {exc}")
++            try:
++                await self.write_status()
++            except Exception as exc:
++                logger.warning(f"could not write onchain status file: {exc}")
++            await asyncio.sleep(self.poll_interval)
++            if False:  # pragma: no cover - makes this an async generator
++                yield ""
++
++    async def _fee_rates(self) -> dict[int, int]:
++        rates: dict[int, int] = {}
++        previous: Optional[float] = None
++        for target in sorted(self.fee_targets):
++            # A target the source cannot estimate inherits the next faster rate.
++            rate = await self.chain.fee_rate(target)
++            rate = rate if rate is not None else previous
++            if rate is None:
++                raise RuntimeError(f"no fee estimate for {target} blocks")
++            rates[target] = max(self.min_fee_rate, math.ceil(rate))
++            previous = rate
++        return rates
++
++    async def fee_quote(
++        self, address: str, amount: int
++    ) -> tuple[int, list[dict[str, int]]]:
++        self.validate_address(address)
++        if amount < self.min_amount:
++            raise ValueError(f"minimum onchain payout is {self.min_amount} sat")
++        if self.max_amount is not None and amount > self.max_amount:
++            raise ValueError(f"maximum onchain payout is {self.max_amount} sat")
++        rates = await self._fee_rates()
++        options = [
++            {
++                "fee_index": i,
++                "fee_reserve": rates[target] * self.splice_vbytes,
++                "estimated_blocks": target,
++            }
++            for i, target in enumerate(self.fee_targets)
++        ]
++        highest = max(option["fee_reserve"] for option in options)
++        r = await self._phoenixd.get("/getbalance")
++        r.raise_for_status()
++        if int(r.json()["balanceSat"]) < amount + highest:
++            raise ValueError("insufficient channel balance for this onchain payout")
++        return highest, options
++
++    def fee_rate_for_reserve(self, fee_reserve: int) -> int:
++        """The sat/vB rate a selected fee option was quoted at."""
++        return max(self.min_fee_rate, fee_reserve // self.splice_vbytes)
++
++    async def send(self, quote: MeltQuote, fee_reserve: int) -> str:
++        """Splice ``quote.amount`` out to ``quote.request`` and return the txid.
++
++        Raises SendFailed only when phoenixd answered without creating a splice.
++        Transport errors propagate so the ledger treats the payment as unknown.
++        """
++        self.validate_address(quote.request)
++        async with self._lock:
++            r = await self._phoenixd.post(
++                "/sendtoaddress",
++                data={
++                    "amountSat": str(quote.amount),
++                    "address": quote.request,
++                    "feerateSatByte": str(self.fee_rate_for_reserve(fee_reserve)),
++                },
++            )
++        if r.status_code in (400, 401, 403, 404):
++            self._refused.add(quote.quote)
++            raise SendFailed(f"phoenixd rejected sendtoaddress: HTTP {r.status_code}")
++        r.raise_for_status()
++        # phoenixd answers 200 with either the funding txid or a failure description.
++        body = r.text.strip()
++        if TXID_PATTERN.fullmatch(body):
++            return body
++        self._refused.add(quote.quote)
++        raise SendFailed(f"phoenixd did not splice out: {body[:200]}")
++
++    async def _splice_outs_since(self, since: Optional[int]) -> list[dict[str, Any]]:
++        """Splice-outs created in the day after ``since``, paging past Lightning sends."""
++        params: dict[str, Any] = {"all": "true", "limit": 500, "offset": 0}
++        if since:
++            params["from"] = since * 1000
++            params["to"] = (since + 86_400) * 1000
++        found: list[dict[str, Any]] = []
++        while True:
++            r = await self._phoenixd.get("/payments/outgoing", params=params)
++            r.raise_for_status()
++            page = r.json()
++            found += [
++                p for p in page if p.get("subType") == "splice_out" and p.get("txId")
++            ]
++            if len(page) < params["limit"]:
++                return found
++            params["offset"] += params["limit"]
++
++    def _destination_vout(
++        self, outputs: Optional[list[tuple[bytes, int]]], quote: MeltQuote
++    ) -> Optional[int]:
++        """Index of the output paying the quote's exact address and amount."""
++        target = script_bytes(quote.request, self.network)
++        for i, (script, value) in enumerate(outputs or []):
++            if script == target and value == quote.amount:
++                return i
++        return None
++
++    async def find_txid(self, quote: MeltQuote) -> Optional[str]:
++        """Recover the txid of a send whose response never reached the ledger.
++
++        A candidate counts only if the transaction pays the quote's exact address
++        and amount, so an unrelated splice-out can never settle this quote.
++        """
++        for payment in await self._splice_outs_since(quote.created_time):
++            recipient = int(payment["sent"]) - int(payment["fees"]) // 1000
++            if recipient != quote.amount:
++                continue
++            outputs = await self.chain.tx_outputs(payment["txId"])
++            if self._destination_vout(outputs, quote) is not None:
++                return payment["txId"]
++        return None
++
++    async def payment_status(self, quote: MeltQuote) -> PaymentStatus:
++        txid = quote.checking_id if TXID_PATTERN.fullmatch(quote.checking_id) else None
++        if txid is None:
++            txid = await self.find_txid(quote)
++        if txid is None:
++            if quote.quote in self._refused:
++                return PaymentStatus(result=PaymentStatusResult.FAILED)
++            # The send may still be in flight; never release proofs on a guess.
++            return PaymentStatus(result=PaymentStatusResult.NOT_FOUND)
++
++        outputs = await self.chain.tx_outputs(txid)
++        if outputs is None:
++            # Broadcast but not yet visible to the chain source.
++            return PaymentStatus(result=PaymentStatusResult.PENDING)
++        vout = self._destination_vout(outputs, quote)
++        if vout is None:
++            message = f"onchain tx {txid} does not pay quote {quote.quote}"
++            logger.error(message)
++            return PaymentStatus(
++                result=PaymentStatusResult.ERROR, error_message=message
++            )
++
++        fee = await self._our_fee(txid, quote.created_time)
++        height = await self.chain.confirmation_height(
++            txid, script_bytes(quote.request, self.network)
++        )
++        confirmed = False
++        if height is not None:
++            confirmed = await self.chain.tip_height() - height + 1 >= self.confirmations
++        return PaymentStatus(
++            result=(
++                PaymentStatusResult.SETTLED
++                if confirmed
++                else PaymentStatusResult.PENDING
++            ),
++            fee=Amount(Unit.sat, fee) if fee is not None else None,
++            preimage=f"{txid}:{vout}",
++        )
++
++    async def _our_fee(self, txid: str, since: Optional[int]) -> Optional[int]:
++        """Our share of the splice fee, as phoenixd recorded it."""
++        try:
++            for payment in await self._splice_outs_since(since):
++                if payment["txId"] == txid:
++                    return int(payment["fees"]) // 1000
++        except Exception as exc:
++            logger.warning(f"could not read phoenixd fee for {txid}: {exc}")
++        return None

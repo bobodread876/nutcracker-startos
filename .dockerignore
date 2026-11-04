@@ -1,2 +1,13 @@
 .git
 .gitmodules
+node_modules
+javascript
+*.s9pk
+upstream-project/*
+!upstream-project/cashu
+admin-ui/*
+!admin-ui/package.json
+!admin-ui/package-lock.json
+!admin-ui/server.js
+!admin-ui/public
+!admin-ui/LICENSE

@@ -1,0 +1,971 @@
+From: Nutcracker <bobodread876@users.noreply.github.com>
+Subject: [PATCH] NUT-30 onchain payment plugin (BDK)
+
+Retires when: cashubtc/nutshell ships the onchain plugin from branch feat/onchain-payment-plugin.
+Generated from the nutcracker/0.22.1 branch of Nutshell (see UPDATING.md), commits 5ecd0646..6b5d7222
+
+---
+ cashu/core/base.py              |   2 +-
+ cashu/core/models/melt.py       |   1 +
+ cashu/core/models/mint_quote.py |   5 +-
+ cashu/mint/crud.py              |   3 +-
+ cashu/mint/db/write.py          |  11 +-
+ cashu/mint/ledger.py            | 121 ++++++++++++---
+ cashu/mint/router.py            |   9 +-
+ cashu/mint/startup.py           |  13 ++
+ cashu/payment/__init__.py       |   3 +
+ cashu/payment/base.py           |  16 +-
+ cashu/payment/onchain.py        | 328 ++++++++++++++++++++++++++++++++++++++++
+ cashu/wallet/cli/cli.py         |   5 +
+ cashu/wallet/v1_api.py          |  11 +-
+ 13 files changed, 495 insertions(+), 33 deletions(-)
+
+diff --git a/cashu/core/base.py b/cashu/core/base.py
+index f3c03bc3..0ffdbe23 100644
+--- a/cashu/core/base.py
++++ b/cashu/core/base.py
+@@ -560,7 +560,7 @@ class MintQuote(LedgerEvent):
+             request=mint_quote_resp.request,
+             checking_id="",
+             unit=mint_quote_resp.unit,
+-            amount=mint_quote_resp.amount,
++            amount=mint_quote_resp.amount or 0,
+             state=state,
+             mint=mint,
+             expiry=mint_quote_resp.expiry,
+diff --git a/cashu/core/models/melt.py b/cashu/core/models/melt.py
+index 2efcd7d1..90ac25a1 100644
+--- a/cashu/core/models/melt.py
++++ b/cashu/core/models/melt.py
+@@ -14,3 +14,4 @@ class PostMeltRequest(BaseModel):
+         None, max_length=settings.mint_max_request_length
+     )
+     prefer_async: Optional[bool] = None
++    fee_index: Optional[int] = Field(default=None, ge=0)
+diff --git a/cashu/core/models/mint_quote.py b/cashu/core/models/mint_quote.py
+index 9a42c537..44de0b77 100644
+--- a/cashu/core/models/mint_quote.py
++++ b/cashu/core/models/mint_quote.py
+@@ -36,7 +36,7 @@ class PostMintQuoteResponse(BaseModel):
+ 
+     quote: str  # quote id
+     request: str  # input payment request
+-    amount: int  # output amount
++    amount: Optional[int] = None  # fixed output amount (not used by NUT-30)
+     unit: str  # output unit
+     method: str  # payment method
+     amount_paid: Optional[int] = None
+@@ -53,7 +53,6 @@ class PostMintQuoteResponse(BaseModel):
+         response = {
+             "quote": mint_quote.quote,
+             "request": mint_quote.request,
+-            "amount": mint_quote.amount,
+             "unit": mint_quote.unit,
+             "method": mint_quote.method,
+             "amount_paid": mint_quote.amount_paid,
+@@ -63,5 +62,7 @@ class PostMintQuoteResponse(BaseModel):
+             "expiry": mint_quote.expiry,
+             "pubkey": mint_quote.pubkey,
+         }
++        if mint_quote.method != "onchain":
++            response["amount"] = mint_quote.amount
+         response.update(mint_quote.method_data)
+         return cls.model_validate(response)
+diff --git a/cashu/mint/crud.py b/cashu/mint/crud.py
+index 25c953e2..72ec2a0c 100644
+--- a/cashu/mint/crud.py
++++ b/cashu/mint/crud.py
+@@ -893,7 +893,7 @@ class LedgerCrudSqlite(LedgerCrud):
+     ) -> None:
+         await (conn or db).execute(
+             f"""
+-            UPDATE {db.table_with_schema("melt_quotes")} SET state = :state, fee_paid = :fee_paid, paid_time = :paid_time, proof = :proof, checking_id = :checking_id, attempt = :attempt, melt_lock = :melt_lock, melt_lock_expires_at = :melt_lock_expires_at, payment_uncertain = :payment_uncertain, method_data = :method_data WHERE quote = :quote
++            UPDATE {db.table_with_schema("melt_quotes")} SET state = :state, fee_reserve = :fee_reserve, fee_paid = :fee_paid, paid_time = :paid_time, proof = :proof, checking_id = :checking_id, attempt = :attempt, melt_lock = :melt_lock, melt_lock_expires_at = :melt_lock_expires_at, payment_uncertain = :payment_uncertain, method_data = :method_data WHERE quote = :quote
+             """,
+             {
+                 "state": quote.state.value,
+@@ -906,6 +906,7 @@ class LedgerCrudSqlite(LedgerCrud):
+                 "proof": quote.payment_preimage,
+                 "quote": quote.quote,
+                 "checking_id": quote.checking_id,
++                "fee_reserve": quote.fee_reserve,
+                 "attempt": quote.attempt,
+                 "melt_lock": quote.melt_lock,
+                 "melt_lock_expires_at": quote.melt_lock_expires_at,
+diff --git a/cashu/mint/db/write.py b/cashu/mint/db/write.py
+index c2d7d8b3..f363ee0d 100644
+--- a/cashu/mint/db/write.py
++++ b/cashu/mint/db/write.py
+@@ -461,6 +461,7 @@ class DbWriteHelper:
+         quote: MeltQuote,
+         conn: Optional[Connection] = None,
+         get_checking_id: Optional[Callable[[MeltQuote], str]] = None,
++        allow_repeated_request: bool = False,
+     ) -> MeltQuote:
+         """Sets the melt quote as pending.
+ 
+@@ -468,6 +469,8 @@ class DbWriteHelper:
+             quote (MeltQuote): Melt quote to set as pending.
+             conn (Optional[Connection]): Connection to use. If not set, a new connection will be created.
+             get_checking_id: Optional derivation using the newly assigned attempt.
++            allow_repeated_request: Only the quote itself must be unpaid; other
++                quotes for the same request or checking ID do not block it.
+         """
+         quote_copy = quote.model_copy()
+         if not quote.checking_id:
+@@ -499,6 +502,8 @@ class DbWriteHelper:
+                     for existing in quotes_by_checking_id + quotes_by_request
+                 }.values()
+             )
++            if allow_repeated_request:
++                quotes_db = [q for q in quotes_db if q.quote == quote.quote]
+             if len(quotes_db) == 0:
+                 raise TransactionError("Melt quote not found.")
+             if any([quote.state == MeltQuoteState.paid for quote in quotes_db]):
+@@ -674,6 +679,7 @@ class DbWriteHelper:
+         keysets: Dict[str, MintKeyset],
+         conn: Optional[Connection] = None,
+         get_checking_id: Optional[Callable[[MeltQuote], str]] = None,
++        allow_repeated_request: bool = False,
+     ) -> MeltQuote:
+         """Sets the melt quote and proofs as pending in a single transaction.
+ 
+@@ -704,7 +710,10 @@ class DbWriteHelper:
+                 proofs, keysets, quote_id=quote.quote, conn=conn
+             )
+             quote = await self._set_melt_quote_pending(
+-                quote, conn=conn, get_checking_id=get_checking_id
++                quote,
++                conn=conn,
++                get_checking_id=get_checking_id,
++                allow_repeated_request=allow_repeated_request,
+             )
+ 
+         return quote
+diff --git a/cashu/mint/ledger.py b/cashu/mint/ledger.py
+index 28acba5c..f4de87ec 100644
+--- a/cashu/mint/ledger.py
++++ b/cashu/mint/ledger.py
+@@ -395,6 +395,7 @@ class Ledger(
+         preimage: Optional[str] = None,
+         lock_token: Optional[str] = None,
+         expected_attempt: Optional[str] = None,
++        method_data: Optional[Dict[str, Any]] = None,
+     ) -> MeltQuote:
+         """Atomically issue change, spend proofs, and mark a melt quote paid.
+ 
+@@ -449,6 +450,8 @@ class Ledger(
+                 melt_quote.fee_paid = fee_paid
+             if preimage:
+                 melt_quote.payment_preimage = preimage
++            if method_data:
++                melt_quote.method_data.update(method_data)
+             if not melt_quote.paid_time:
+                 melt_quote.paid_time = int(time.time())
+ 
+@@ -608,6 +611,8 @@ class Ledger(
+         expected_attempt: Optional[str] = None,
+         lock_token: Optional[str] = None,
+         payment_uncertain: Optional[bool] = None,
++        preimage: Optional[str] = None,
++        method_data: Optional[Dict[str, Any]] = None,
+     ) -> MeltQuote:
+         """Update the backend checking ID within the quote transaction."""
+         async with self.db.get_connection(
+@@ -633,6 +638,10 @@ class Ledger(
+             melt_quote.checking_id = checking_id
+             if payment_uncertain is not None:
+                 melt_quote.payment_uncertain = payment_uncertain
++            if preimage:
++                melt_quote.payment_preimage = preimage
++            if method_data:
++                melt_quote.method_data.update(method_data)
+             await self.crud.update_melt_quote(
+                 quote=melt_quote,
+                 db=self.db,
+@@ -659,7 +668,8 @@ class Ledger(
+             MintQuote: Mint quote object.
+         """
+         logger.trace("called request_mint")
+-        if not quote_request.amount > 0:
++        plugin = payment_method_registry.get(method_str)
++        if not plugin.allows_partial_mint and not quote_request.amount > 0:
+             raise TransactionError("amount must be positive")
+         if (
+             method_str == Method.bolt11.name
+@@ -723,10 +733,12 @@ class Ledger(
+ 
+         now = int(time.time())
+         expiry = None
+-        if settings.mint_quote_ttl is not None:
++        if not plugin.supports_mint_quote_expiry:
++            expiry = None
++        elif settings.mint_quote_ttl is not None:
+             expiry = now + settings.mint_quote_ttl
+         else:
+-            expiry = plugin.quote_expiry(invoice_response.payment_request)
++            expiry = plugin.mint_quote_expiry(invoice_response.payment_request)
+ 
+         quote = MintQuote(
+             quote=generate_uuid_v7(),
+@@ -890,6 +902,16 @@ class Ledger(
+         if quote.state != MintQuoteState.paid:
+             raise QuoteNotPaidError()
+         plugin = payment_method_registry.get(quote.method)
++        quote_unit, quote_method = self._verify_and_get_unit_method(
++            quote.unit, quote.method
++        )
++        min_amount = plugin.settings_for(
++            self._get_backend(quote_method, quote_unit), quote_unit
++        ).min_amount
++        if min_amount is not None and sum_amount_outputs < min_amount:
++            raise TransactionError(
++                f"amount to mint is below minimum amount {min_amount}"
++            )
+ 
+         # Also validate quotes created before invoice amount checks were added.
+         if quote.method == Method.bolt11.name:
+@@ -980,8 +1002,15 @@ class Ledger(
+         units = set([q.unit for q in quotes])
+         if len(units) > 1:
+             raise TransactionError("all quotes must have the same unit")
+-        if units.pop() != output_unit.name:
++        batch_unit = Unit[next(iter(units))]
++        if batch_unit != output_unit:
+             raise TransactionError("quote unit does not match output unit")
++        _, backend_method = self._verify_and_get_unit_method(
++            batch_unit.name, batch_method
++        )
++        min_amount = plugin.settings_for(
++            self._get_backend(backend_method, batch_unit), batch_unit
++        ).min_amount
+ 
+         for quote in quotes:
+             if quote.pending:
+@@ -1020,6 +1049,12 @@ class Ledger(
+         )
+         if any(amount <= 0 for amount in quote_amounts):
+             raise TransactionError("quote amounts must be positive")
++        if min_amount is not None and any(
++            amount < min_amount for amount in quote_amounts
++        ):
++            raise TransactionError(
++                f"amount to mint is below minimum amount {min_amount}"
++            )
+         if not plugin.allows_partial_mint:
+             if sum(quote_amounts) != sum_amount_outputs:
+                 raise TransactionError(
+@@ -1108,7 +1143,12 @@ class Ledger(
+             raise TransactionError("internal payments do not support mpp")
+ 
+         internal_fee = Amount(unit, 0)  # no internal fees
+-        amount = Amount(unit, mint_quote.amount)
++        amount = Amount(
++            unit,
++            int(getattr(melt_quote, "amount"))
++            if plugin.allows_partial_mint
++            else mint_quote.amount,
++        )
+ 
+         payment_quote = PaymentQuoteResponse(
+             checking_id=mint_quote.checking_id,
+@@ -1246,8 +1286,8 @@ class Ledger(
+         unit, method = self._verify_and_get_unit_method(
+             melt_quote.unit, melt_quote.method
+         )
++        plugin = payment_method_registry.get(melt_quote.method)
+         try:
+-            plugin = payment_method_registry.get(melt_quote.method)
+             status = await asyncio.wait_for(
+                 plugin.get_outgoing_payment_status(
+                     self._get_backend(method, unit), melt_quote
+@@ -1275,6 +1315,7 @@ class Ledger(
+                     preimage=status.preimage,
+                     lock_token=lock_token,
+                     expected_attempt=melt_quote.attempt,
++                    method_data=plugin.payment_method_data(status.preimage),
+                 )
+             case PaymentStatusResult.FAILED:
+                 if melt_quote.payment_uncertain:
+@@ -1345,7 +1386,11 @@ class Ledger(
+             request=melt_quote.request, db=self.db
+         )
+ 
+-        is_internal = mint_quote is not None and mint_quote.unit == melt_quote.unit
++        is_internal = (
++            mint_quote is not None
++            and mint_quote.unit == melt_quote.unit
++            and mint_quote.method == melt_quote.method
++        )
+ 
+         if melt_quote.pending:
+             claimed = await self.db_write.claim_melt_quote_lease(melt_quote)
+@@ -1448,22 +1493,24 @@ class Ledger(
+             if melt_quote.expiry is not None and melt_quote.expiry < time.time():
+                 raise QuoteExpiredError("quote expired")
+ 
+-            if mint_quote.amount != melt_quote.amount:
+-                raise AmountMismatchError("amounts do not match")
+             if mint_quote.method != melt_quote.method:
+                 raise TransactionError("methods do not match")
+             plugin = payment_method_registry.get(melt_quote.method)
++            # Reusable requests (onchain addresses) accept any amount.
++            if not plugin.allows_partial_mint and mint_quote.amount != melt_quote.amount:
++                raise AmountMismatchError("amounts do not match")
+             try:
+                 plugin.validate_internal_settlement(mint_quote, melt_quote)
+             except ValueError as exc:
+                 raise TransactionError(str(exc)) from exc
+ 
+-            if mint_quote.paid:
+-                raise InvoiceAlreadyPaidError("mint quote already paid")
+-            if mint_quote.issued:
+-                raise QuoteAlreadyIssuedError("mint quote already issued")
+-            if mint_quote.state != MintQuoteState.unpaid:
+-                raise TransactionError("mint quote is not unpaid")
++            if not plugin.allows_partial_mint:
++                if mint_quote.paid:
++                    raise InvoiceAlreadyPaidError("mint quote already paid")
++                if mint_quote.issued:
++                    raise QuoteAlreadyIssuedError("mint quote already issued")
++                if mint_quote.state != MintQuoteState.unpaid:
++                    raise TransactionError("mint quote is not unpaid")
+ 
+             logger.info(
+                 f"Settling {melt_quote.method} payment internally: {melt_quote.quote} ->"
+@@ -1475,7 +1522,13 @@ class Ledger(
+             melt_quote.state = MeltQuoteState.paid
+             melt_quote.paid_time = paid_time
+ 
+-            mint_quote.state = MintQuoteState.paid
++            if plugin.allows_partial_mint:
++                mint_quote.amount_paid = (
++                    mint_quote.amount_paid or 0
++                ) + melt_quote.amount
++                mint_quote.state_val = MintQuoteState.paid
++            else:
++                mint_quote.state = MintQuoteState.paid
+             mint_quote.paid_time = paid_time
+             mint_quote.updated_at = paid_time
+ 
+@@ -1502,6 +1555,7 @@ class Ledger(
+         quote: str,
+         outputs: Optional[List[BlindedMessage]] = None,
+         method_str: Optional[str] = None,
++        fee_index: Optional[int] = None,
+     ) -> PostMeltQuoteResponse:
+         """Invalidates proofs and pays a Lightning invoice asynchronously.
+ 
+@@ -1521,6 +1575,7 @@ class Ledger(
+             quote=quote,
+             outputs=outputs,
+             method_str=method_str,
++            fee_index=fee_index,
+         )
+ 
+         async def melt_task():
+@@ -1541,6 +1596,7 @@ class Ledger(
+         quote: str,
+         outputs: Optional[List[BlindedMessage]] = None,
+         method_str: Optional[str] = None,
++        fee_index: Optional[int] = None,
+     ) -> PostMeltQuoteResponse:
+         """Invalidates proofs and pays a Lightning invoice.
+ 
+@@ -1560,6 +1616,7 @@ class Ledger(
+             quote=quote,
+             outputs=outputs,
+             method_str=method_str,
++            fee_index=fee_index,
+         )
+         return await self._execute_melt_payment(melt_quote, proofs, outputs)
+ 
+@@ -1570,6 +1627,7 @@ class Ledger(
+         quote: str,
+         outputs: Optional[List[BlindedMessage]] = None,
+         method_str: Optional[str] = None,
++        fee_index: Optional[int] = None,
+     ) -> MeltQuote:
+         """Validates a melt request and durably sets the quote and proofs to pending."""
+         # make sure we're allowed to melt
+@@ -1580,6 +1638,19 @@ class Ledger(
+         melt_quote = await self.get_melt_quote(quote_id=quote)
+         if method_str is not None and melt_quote.method != method_str:
+             raise NotAllowedError("quote payment method does not match endpoint")
++        if melt_quote.method == "onchain":
++            options = melt_quote.method_data.get("fee_options", [])
++            selected = next(
++                (option for option in options if option.get("fee_index") == fee_index),
++                None,
++            )
++            if selected is None:
++                raise TransactionError("fee_index was not offered for this quote")
++            previous = melt_quote.method_data.get("selected_fee_index")
++            if previous is not None and previous != fee_index:
++                raise TransactionError("onchain fee option was already selected")
++            melt_quote.method_data["selected_fee_index"] = fee_index
++            melt_quote.fee_reserve = int(selected["fee_reserve"])
+         if melt_quote.paid:
+             raise InvoiceAlreadyPaidError(
+                 f"melt quote is not unpaid: {melt_quote.state}"
+@@ -1590,6 +1661,7 @@ class Ledger(
+         unit, method = self._verify_and_get_unit_method(
+             melt_quote.unit, melt_quote.method
+         )
++        plugin = payment_method_registry.get(melt_quote.method)
+ 
+         # make sure that the proofs are in the same unit as the quote
+         self._verify_proofs_unit(proofs, expected_unit=unit)
+@@ -1643,9 +1715,10 @@ class Ledger(
+                 proofs=proofs,
+                 keysets=self.keysets,
+                 conn=conn,
+-                get_checking_id=lambda quote: payment_method_registry.get(
+-                    quote.method
+-                ).get_payment_checking_id(self._get_backend(method, unit), quote),
++                get_checking_id=lambda quote: plugin.get_payment_checking_id(
++                    self._get_backend(method, unit), quote
++                ),
++                allow_repeated_request=plugin.allows_repeated_melt_requests,
+             )
+ 
+         return melt_quote
+@@ -1747,12 +1820,22 @@ class Ledger(
+ 
+         # A response for this send establishes that it completed or was accepted.
+         # Exceptions/ERROR do not: the request may still be reaching the backend.
++        accepted = payment.settled or payment.pending
+         melt_quote = await self._update_melt_checking_id(
+             melt_quote.quote,
+             payment.checking_id or melt_quote.checking_id,
+             expected_attempt=melt_quote.attempt,
+             lock_token=melt_quote.melt_lock,
+             payment_uncertain=payment.error,
++            preimage=payment.preimage if accepted else None,
++            method_data=(
++                {
++                    **(payment.model_extra or {}),
++                    **plugin.payment_method_data(payment.preimage),
++                }
++                if accepted
++                else None
++            ),
+         )
+ 
+         match payment.result:
+diff --git a/cashu/mint/router.py b/cashu/mint/router.py
+index 26e6c9aa..525fc77f 100644
+--- a/cashu/mint/router.py
++++ b/cashu/mint/router.py
+@@ -26,7 +26,6 @@ from ..core.models import (
+     PostMintBatchRequest,
+     PostMintBatchResponse,
+     PostMintQuoteCheckRequest,
+-    PostMintQuoteRequest,
+     PostMintQuoteResponse,
+     PostMintRequest,
+     PostMintResponse,
+@@ -370,7 +369,7 @@ async def keysets() -> KeysetsResponse:
+ )
+ @limiter.limit(f"{settings.mint_transaction_rate_limit_per_minute}/minute")
+ async def mint_quote(
+-    request: Request, method: str, payload: PostMintQuoteRequest
++    request: Request, method: str, payload: dict
+ ) -> PostMintQuoteResponse:
+     """
+     Request minting of new tokens. The mint responds with a Lightning invoice.
+@@ -380,7 +379,7 @@ async def mint_quote(
+     """
+     logger.trace(f"> POST /v1/mint/quote/bolt11: payload={payload}")
+     plugin = payment_method_registry.get(method)
+-    validated_payload = plugin.validate_mint_quote_request(payload.model_dump())
++    validated_payload = plugin.validate_mint_quote_request(payload)
+     if method == Method.bolt11.name:
+         quote = await ledger.mint_quote(validated_payload)
+     else:
+@@ -628,12 +627,13 @@ async def melt(
+     Requests tokens to be destroyed and sent out via Lightning.
+     """
+     logger.trace(f"> POST /v1/melt/bolt11: {payload}")
+-    if payload.prefer_async:
++    if method == "onchain" or payload.prefer_async:
+         resp = await ledger.async_melt(
+             proofs=payload.inputs,
+             quote=payload.quote,
+             outputs=payload.outputs,
+             method_str=method,
++            fee_index=payload.fee_index,
+         )
+     else:
+         resp = await ledger.melt(
+@@ -641,6 +641,7 @@ async def melt(
+             quote=payload.quote,
+             outputs=payload.outputs,
+             method_str=method,
++            fee_index=payload.fee_index,
+         )
+     logger.trace(f"< POST /v1/melt/bolt11: {resp}")
+     return resp
+diff --git a/cashu/mint/startup.py b/cashu/mint/startup.py
+index 1ace350d..22090889 100644
+--- a/cashu/mint/startup.py
++++ b/cashu/mint/startup.py
+@@ -47,6 +47,19 @@ for key, value in settings.model_dump().items():
+     if key in ["mint_database", "mint_test_database", "mint_auth_database"]:
+         value = mask_db_location(value)
+ 
++    if key == "mint_payment_backends":
++        value = [
++            {
++                option: (
++                    "********"
++                    if option in {"mnemonic", "password", "rpc_password"}
++                    else setting
++                )
++                for option, setting in backend.items()
++            }
++            for backend in value
++        ]
++
+     logger.debug(f"{key}: {value}")
+ 
+ wallets_module = importlib.import_module("cashu.lightning")
+diff --git a/cashu/payment/__init__.py b/cashu/payment/__init__.py
+index 4b037489..581d05a6 100644
+--- a/cashu/payment/__init__.py
++++ b/cashu/payment/__init__.py
+@@ -6,6 +6,7 @@ adapter preserves the existing Lightning backend and wire behavior.
+ 
+ from .base import PaymentMethodPlugin
+ from .bolt11 import bolt11_payment_method
++from .onchain import onchain_payment_method
+ from .registry import PaymentMethodRegistry, payment_method_registry
+ 
+ # Built-ins use the same registry as third-party plugins. Importing the payment
+@@ -13,6 +14,8 @@ from .registry import PaymentMethodRegistry, payment_method_registry
+ # is required to make BOLT11 available.
+ if payment_method_registry.maybe_get(bolt11_payment_method.method) is None:
+     payment_method_registry.register(bolt11_payment_method)
++if payment_method_registry.maybe_get(onchain_payment_method.method) is None:
++    payment_method_registry.register(onchain_payment_method)
+ 
+ __all__ = [
+     "PaymentMethodPlugin",
+diff --git a/cashu/payment/base.py b/cashu/payment/base.py
+index 39f0085f..5885a657 100644
+--- a/cashu/payment/base.py
++++ b/cashu/payment/base.py
+@@ -40,6 +40,10 @@ class PaymentMethodPlugin(ABC):
+     mint_quote_request_model: type[BaseModel] = PostMintQuoteRequest
+     melt_quote_request_model: type[BaseModel] = PostMeltQuoteRequest
+     allows_partial_mint: bool = False
++    supports_mint_quote_expiry: bool = True
++    # Whether one payment request may be paid by several melt quotes (e.g. a
++    # reused onchain address). Single-use requests such as BOLT11 must not be.
++    allows_repeated_melt_requests: bool = False
+ 
+     def create_backend(self, unit: Unit, config: dict[str, Any]) -> Any:
+         """Construct a configured mint backend for this method.
+@@ -106,6 +110,12 @@ class PaymentMethodPlugin(ABC):
+     def quote_expiry(self, payment_request: str) -> Optional[int]:
+         """Return the payment request's absolute expiry, if it has one."""
+ 
++    def mint_quote_expiry(self, payment_request: str) -> Optional[int]:
++        return self.quote_expiry(payment_request)
++
++    def melt_quote_expiry(self, payment_request: str) -> Optional[int]:
++        return self.quote_expiry(payment_request)
++
+     def validate_internal_settlement(
+         self, mint_quote: MintQuote, melt_quote: MeltQuote
+     ) -> None:
+@@ -116,12 +126,16 @@ class PaymentMethodPlugin(ABC):
+ 
+     def validate_payment_request(self, backend: Any, request: str) -> Optional[int]:
+         """Validate a melt request locally and return its absolute expiry, if any."""
+-        return self.quote_expiry(request)
++        return self.melt_quote_expiry(request)
+ 
+     def get_payment_checking_id(self, backend: Any, quote: MeltQuote) -> str:
+         """Derive the attempt's checking ID before sending, without doing I/O."""
+         return quote.checking_id
+ 
++    def payment_method_data(self, preimage: Optional[str]) -> dict[str, Any]:
++        """Method-specific quote fields derived from a payment's proof."""
++        return {}
++
+     async def startup(self, backend: Any) -> None:
+         startup = getattr(backend, "startup", None)
+         if startup is not None:
+diff --git a/cashu/payment/onchain.py b/cashu/payment/onchain.py
+new file mode 100644
+index 00000000..a3478ffc
+--- /dev/null
++++ b/cashu/payment/onchain.py
+@@ -0,0 +1,328 @@
++from __future__ import annotations
++
++import asyncio
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++import bdkpython as bdk
++from pydantic import BaseModel, ConfigDict, Field
++
++from ..core.base import Amount, MeltQuote, MintQuote, Unit
++from ..core.models import PostMeltQuoteRequest, PostMintQuoteRequest
++from ..lightning.base import (
++    InvoiceResponse,
++    PaymentQuoteResponse,
++    PaymentResponse,
++    PaymentResult,
++    PaymentStatus,
++    PaymentStatusResult,
++    StatusResponse,
++)
++from .base import PaymentMethodPlugin, PaymentMethodSettings
++
++
++class OnchainMintQuoteRequest(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    unit: str
++    pubkey: str
++    amount: int = Field(default=0, exclude=True)
++    description: None = Field(default=None, exclude=True)
++
++
++class OnchainMeltQuoteRequest(PostMeltQuoteRequest):
++    model_config = ConfigDict(extra="forbid")
++
++    amount: int = Field(gt=0)
++
++
++class BdkOnchainBackend:
++    """Persistent BIP84 BDK wallet synchronized through Bitcoin Core RPC."""
++
++    def __init__(self, unit: Unit, config: dict[str, Any]) -> None:
++        if unit != Unit.sat:
++            raise ValueError("the onchain backend currently supports only sat")
++        self.unit = unit
++        self.confirmations = int(config.get("confirmations", 1))
++        self.min_amount = int(config.get("min_amount", 1))
++        self.fee_target = int(config.get("fee_target", 1))
++        self.fallback_fee_rate = float(config.get("fallback_fee_rate", 2))
++        self.quote_max_input_count = int(config.get("quote_max_input_count", 10))
++        wallet_name = str(config.get("wallet", "nutshell-onchain"))
++
++        mnemonic = config.get("mnemonic")
++        mnemonic_file = config.get("mnemonic_file")
++        if mnemonic_file:
++            mnemonic = Path(str(mnemonic_file)).read_text().strip()
++        if not mnemonic:
++            raise ValueError("onchain backend requires mnemonic or mnemonic_file")
++
++        database_path = Path(
++            str(config.get("database_path", f"./data/{wallet_name}.sqlite"))
++        )
++        database_path.parent.mkdir(parents=True, exist_ok=True)
++        secret = bdk.DescriptorSecretKey(
++            bdk.Network.REGTEST, bdk.Mnemonic.from_string(str(mnemonic)), None
++        )
++        external = bdk.Descriptor.new_bip84(
++            secret, bdk.KeychainKind.EXTERNAL, bdk.Network.REGTEST
++        )
++        internal = bdk.Descriptor.new_bip84(
++            secret, bdk.KeychainKind.INTERNAL, bdk.Network.REGTEST
++        )
++        self._wallet = bdk.Wallet(
++            external,
++            internal,
++            bdk.Network.REGTEST,
++            bdk.DatabaseConfig.SQLITE(
++                bdk.SqliteDbConfiguration(path=str(database_path))
++            ),
++        )
++        self._blockchain = bdk.Blockchain(
++            bdk.BlockchainConfig.RPC(
++                bdk.RpcConfig(
++                    url=str(config.get("rpc_url", "http://127.0.0.1:18443")),
++                    auth=bdk.Auth.USER_PASS(
++                        str(config.get("rpc_user", "cashu")),
++                        str(config.get("rpc_password", "cashu")),
++                    ),
++                    network=bdk.Network.REGTEST,
++                    wallet_name=wallet_name,
++                    sync_params=bdk.RpcSyncParams(
++                        start_script_count=int(config.get("start_script_count", 100)),
++                        start_time=int(config.get("start_time", 0)),
++                        force_start_time=False,
++                        poll_rate_sec=1,
++                    ),
++                )
++            )
++        )
++        self._lock = asyncio.Lock()
++
++    def _sync(self) -> None:
++        self._wallet.sync(self._blockchain, None)
++
++    @staticmethod
++    def _is_confirmed(
++        transaction: bdk.TransactionDetails, height: int, confirmations: int
++    ) -> bool:
++        block = transaction.confirmation_time
++        return block is not None and height - block.height + 1 >= confirmations
++
++    async def status(self) -> StatusResponse:
++        try:
++            async with self._lock:
++                await asyncio.to_thread(self._sync)
++                balance = await asyncio.to_thread(self._wallet.get_balance)
++            return StatusResponse(balance=Amount(Unit.sat, balance.total))
++        except Exception as exc:
++            return StatusResponse(balance=Amount(Unit.sat, 0), error_message=str(exc))
++
++    async def new_address(self) -> str:
++        async with self._lock:
++            info = await asyncio.to_thread(
++                self._wallet.get_address, bdk.AddressIndex.NEW()
++            )
++        return info.address.as_string()
++
++    async def received(self, address: str) -> int:
++        target = bdk.Address(address, bdk.Network.REGTEST).script_pubkey().to_bytes()
++        async with self._lock:
++            await asyncio.to_thread(self._sync)
++            height = await asyncio.to_thread(self._blockchain.get_height)
++            transactions = await asyncio.to_thread(self._wallet.list_transactions, True)
++        return sum(
++            output.value
++            for details in transactions
++            if self._is_confirmed(details, height, self.confirmations)
++            and details.transaction
++            for output in details.transaction.output()
++            if output.script_pubkey.to_bytes() == target
++            and output.value >= self.min_amount
++        )
++
++    async def fee_quote(
++        self, address: str, amount: int
++    ) -> tuple[int, list[dict[str, int]]]:
++        bdk.Address(address, bdk.Network.REGTEST)
++        try:
++            sat_vb = (
++                await asyncio.to_thread(self._blockchain.estimate_fee, self.fee_target)
++            ).as_sat_per_vb()
++        except Exception:
++            sat_vb = self.fallback_fee_rate
++        # Conservative P2WPKH weight bound: version/locktime/varints, configured
++        # maximum inputs, destination, and change. This mirrors CDK's bounded
++        # input-count approach and keeps the fixed NUT-30 quote from underfunding.
++        estimated_vbytes = 72 + 68 * self.quote_max_input_count
++        reserve = max(1, int(sat_vb * estimated_vbytes + 0.999999))
++        return reserve, [
++            {
++                "fee_index": 0,
++                "fee_reserve": reserve,
++                "estimated_blocks": self.fee_target,
++            }
++        ]
++
++    async def send(self, address: str, amount: int) -> tuple[str, int, str]:
++        destination = bdk.Address(address, bdk.Network.REGTEST).script_pubkey()
++        async with self._lock:
++            await asyncio.to_thread(self._sync)
++            try:
++                sat_vb = (
++                    await asyncio.to_thread(
++                        self._blockchain.estimate_fee, self.fee_target
++                    )
++                ).as_sat_per_vb()
++            except Exception:
++                sat_vb = self.fallback_fee_rate
++            result = await asyncio.to_thread(
++                bdk.TxBuilder()
++                .add_recipient(destination, amount)
++                .fee_rate(sat_vb)
++                .finish,
++                self._wallet,
++            )
++            finalized = await asyncio.to_thread(self._wallet.sign, result.psbt, None)
++            if not finalized:
++                raise RuntimeError("BDK could not finalize onchain transaction")
++            transaction = result.psbt.extract_tx()
++            await asyncio.to_thread(self._blockchain.broadcast, transaction)
++        txid = transaction.txid()
++        vout = next(
++            i
++            for i, output in enumerate(transaction.output())
++            if output.script_pubkey.to_bytes() == destination.to_bytes()
++        )
++        return txid, result.transaction_details.fee or 0, f"{txid}:{vout}"
++
++    async def transaction_status(self, txid: str) -> PaymentStatus:
++        async with self._lock:
++            await asyncio.to_thread(self._sync)
++            height = await asyncio.to_thread(self._blockchain.get_height)
++            transactions = await asyncio.to_thread(self._wallet.list_transactions, True)
++        details = next((tx for tx in transactions if tx.txid == txid), None)
++        if details is None:
++            return PaymentStatus(result=PaymentStatusResult.NOT_FOUND)
++        outpoint = txid
++        if details.transaction:
++            external = [
++                i
++                for i, output in enumerate(details.transaction.output())
++                if not self._wallet.is_mine(output.script_pubkey)
++            ]
++            if external:
++                outpoint = f"{txid}:{external[0]}"
++        return PaymentStatus(
++            result=(
++                PaymentStatusResult.SETTLED
++                if self._is_confirmed(details, height, self.confirmations)
++                else PaymentStatusResult.PENDING
++            ),
++            fee=Amount(Unit.sat, details.fee or 0),
++            preimage=outpoint,
++        )
++
++
++class OnchainPaymentMethod(PaymentMethodPlugin):
++    method = "onchain"
++    mint_quote_request_model = OnchainMintQuoteRequest
++    melt_quote_request_model = OnchainMeltQuoteRequest
++    allows_partial_mint = True
++    allows_repeated_melt_requests = True
++    supports_mint_quote_expiry = False
++
++    def create_backend(self, unit: Unit, config: dict[str, Any]) -> BdkOnchainBackend:
++        return BdkOnchainBackend(unit, config)
++
++    def settings_for(
++        self, backend: BdkOnchainBackend, unit: Unit
++    ) -> PaymentMethodSettings:
++        return PaymentMethodSettings(
++            method_name=self.method,
++            min_amount=backend.min_amount,
++            options={"confirmations": backend.confirmations},
++        )
++
++    async def create_incoming_payment(
++        self, backend: BdkOnchainBackend, request: PostMintQuoteRequest
++    ) -> InvoiceResponse:
++        address = await backend.new_address()
++        return InvoiceResponse(ok=True, checking_id=address, payment_request=address)
++
++    async def get_incoming_payment_status(
++        self, backend: BdkOnchainBackend, quote: MintQuote
++    ) -> PaymentStatus:
++        paid = await backend.received(quote.checking_id)
++        return PaymentStatus(
++            result=(
++                PaymentStatusResult.SETTLED
++                if paid > 0
++                else PaymentStatusResult.PENDING
++            ),
++            amount_paid=Amount(Unit.sat, paid),
++        )
++
++    async def quote_outgoing_payment(
++        self, backend: BdkOnchainBackend, request: PostMeltQuoteRequest
++    ) -> PaymentQuoteResponse:
++        amount = int(getattr(request, "amount"))
++        reserve, options = await backend.fee_quote(request.request, amount)
++        return PaymentQuoteResponse.model_validate(
++            {
++                "checking_id": request.request,
++                "amount": Amount(Unit.sat, amount),
++                "fee": Amount(Unit.sat, reserve),
++                "fee_options": options,
++                "selected_fee_index": None,
++                "outpoint": None,
++            }
++        )
++
++    async def execute_outgoing_payment(
++        self, backend: BdkOnchainBackend, quote: MeltQuote, fee_limit: Amount
++    ) -> PaymentResponse:
++        txid, fee, outpoint = await backend.send(quote.request, quote.amount)
++        return PaymentResponse(
++            result=PaymentResult.PENDING,
++            checking_id=txid,
++            # The selected reserve is the maximum fee chargeable to the user.
++            fee=Amount(Unit.sat, min(fee, fee_limit.amount)),
++            preimage=outpoint,
++        )
++
++    async def get_outgoing_payment_status(
++        self, backend: BdkOnchainBackend, quote: MeltQuote
++    ) -> PaymentStatus:
++        status = await backend.transaction_status(quote.checking_id)
++        if status.fee and status.fee.amount > quote.fee_reserve:
++            status.fee = Amount(Unit.sat, quote.fee_reserve)
++        return status
++
++    def quote_expiry(self, payment_request: str) -> Optional[int]:
++        return None
++
++    def mint_quote_expiry(self, payment_request: str) -> Optional[int]:
++        # An unbounded reusable address avoids accepting deposits first seen
++        # after an expiry, which would violate NUT-30.
++        return None
++
++    def melt_quote_expiry(self, payment_request: str) -> Optional[int]:
++        return int(time.time()) + 600
++
++    def payment_method_data(self, preimage: Optional[str]) -> dict[str, Any]:
++        # For onchain payouts the proof of payment is the txid:vout outpoint.
++        return {"outpoint": preimage} if preimage else {}
++
++    def validate_internal_settlement(
++        self, mint_quote: MintQuote, melt_quote: MeltQuote
++    ) -> None:
++        if mint_quote.request != melt_quote.request:
++            raise ValueError("payment requests do not match")
++
++
++onchain_payment_method = OnchainPaymentMethod()
++
++# Compatibility for early users of this branch.
++BitcoinCoreRpcBackend = BdkOnchainBackend
+diff --git a/cashu/wallet/cli/cli.py b/cashu/wallet/cli/cli.py
+index 58881f3a..4f45990b 100644
+--- a/cashu/wallet/cli/cli.py
++++ b/cashu/wallet/cli/cli.py
+@@ -507,6 +507,11 @@ async def _pay(
+         quote = await wallet.melt_quote_for_method(
+             method, invoice, parsed_method_options
+         )
++        if method == "onchain" and "fee_index" not in parsed_method_options:
++            fee_options = quote.method_data.get("fee_options", [])
++            if fee_options:
++                selected = min(fee_options, key=lambda option: option["fee_reserve"])
++                parsed_method_options["fee_index"] = selected["fee_index"]
+     logger.debug(f"Quote: {quote}")
+     total_amount = quote.amount + quote.fee_reserve
+     # estimate ecash fee for the coinselected proofs
+diff --git a/cashu/wallet/v1_api.py b/cashu/wallet/v1_api.py
+index e127d23a..9cd8903d 100644
+--- a/cashu/wallet/v1_api.py
++++ b/cashu/wallet/v1_api.py
+@@ -389,10 +389,13 @@ class LedgerAPI(SupportsAuth):
+     ) -> PostMintQuoteResponse:
+         """Request a mint quote for an explicitly selected payment method."""
+         logger.trace(f"Requesting mint: POST /v1/mint/quote/{method}")
+-        payload = PostMintQuoteRequest(
+-            unit=unit.name, amount=amount, description=memo, pubkey=pubkey
+-        )
+-        payload_dict = payload.model_dump()
++        if method == "onchain":
++            payload_dict = {"unit": unit.name, "pubkey": pubkey}
++        else:
++            payload = PostMintQuoteRequest(
++                unit=unit.name, amount=amount, description=memo, pubkey=pubkey
++            )
++            payload_dict = payload.model_dump()
+         if method_options:
+             payload_dict.update(method_options)
+         resp = await self._request(

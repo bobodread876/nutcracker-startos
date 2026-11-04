@@ -1,79 +1,72 @@
 # Updating the upstream version
 
-Nutshell runs the official `cashubtc/nutshell` multi-architecture image. The GitHub stable
-release is the source of truth; the matching Docker Hub image is what the package executes.
+Nutcracker builds `./Dockerfile`: the official `cashubtc/nutshell` image, digest-pinned, with Nutshell's source from the `upstream-project/` submodule copied over `/app/cashu` and `patches/*.patch` applied on top. Three pins move together on every bump:
 
-The pin lives in `startos/manifest/index.ts` at `images.main.source.dockerTag`, and it carries
-**both** a tag and a digest — `cashubtc/nutshell:<version>@sha256:<digest>`. A tag alone is not a
-pin: the digest is what makes a rebuild reproduce the image that passed testing.
+| Pin | Where |
+| --- | ----- |
+| Image tag **and** `@sha256` digest | `Dockerfile` (`FROM` line) |
+| Submodule commit at the same tag | `upstream-project/` (`git -C upstream-project checkout <tag>`) |
+| The patches, regenerated against that tag | `patches/` |
 
-## Determining the upstream version
+The admin dashboard moves independently: `admin-ui/` (submodule of bobodread876/cashu-admin-ui) and the `node:22-bookworm-slim` digest in the Dockerfile's first stage. Bump the digest with `docker buildx imagetools inspect node:22-bookworm-slim`; the build fails if `node:sqlite` or the dashboard's dependencies do not load.
 
-```sh
-gh release view -R cashubtc/nutshell --json tagName,publishedAt,url
-```
-
-Ignore prereleases unless the package explicitly intends to ship one.
+The GitHub stable release is the source of truth: `gh release view -R cashubtc/nutshell --json tagName,publishedAt,url`. Ignore prereleases.
 
 ## Review compatibility first
 
-Read every upstream release between the packaged and target versions, and never automate this
-away. Check:
+Read every upstream release between the packaged and target versions. Check:
 
-- database migrations and downgrade safety;
-- renamed or removed environment variables — `startos/mintEnvironment.ts` builds the whole
-  environment, and a renamed variable is not a type error: the mint starts anyway, on defaults;
-- Python command or image working-directory changes (`exec.command` in `startos/main.ts`);
-- CLNRest URL, rune, and transport behavior;
-- data paths and file ownership — `MINT_DATABASE` is a directory, and `mintDatabaseFile` in
-  `startos/utils.ts` reports the filename inside it;
-- supported architectures in the image manifest.
+- database migrations and downgrade safety, and whether upstream now numbers a migration the patches also use (`m043`, `m044` in patch 0001/0003); a clash must be renumbered before release;
+- renamed or removed environment variables (`startos/mintEnvironment.ts` builds the whole environment, and a renamed variable is not a type error);
+- the image's working directory, Python version and command (`exec.command` in `startos/main.ts`);
+- whether upstream merged any patch's feature, which retires that patch (each patch header names the condition);
+- supported architectures, and whether `bdkpython` now publishes a Linux arm64 wheel (if so, add `aarch64` to the manifest and a second hash to `bdk-requirements.txt`).
 
-Two cross-package claims are worth re-checking on any cln bump rather than a Nutshell one:
-`clnrestPort` is imported from `cln-startos/startos/utils` (so a change there is a build failure
-here), but the `clnrest` host id and the `?rune=` query parameter are read by convention from
-`cln-startos/startos/interfaces.ts`. If cln stops publishing the rune that way, `main.ts` throws
-instead of starting a mint with no Lightning backend — loud, but still a break.
+## Regenerating the patches
+
+The patches come from the `nutcracker/<version>` branch of a Nutshell checkout, rebased onto the new tag. Each patch is a `git diff` restricted to `cashu/`:
+
+```sh
+git -C <nutshell> diff <from> <to> -- cashu > patches/000N-<name>.patch   # keep the header block
+```
+
+Then confirm they apply to the exact source in the new image:
+
+```sh
+docker create --name n cashubtc/nutshell:<version>@sha256:<digest>
+docker cp n:/app/cashu /tmp/img-cashu && docker rm n
+diff -r upstream-project/cashu /tmp/img-cashu          # must be identical
+cd /tmp && for p in <repo>/patches/*.patch; do patch -p1 --forward --batch < "$p"; done
+```
+
+Run the full Nutshell test suite on the rebased branch before regenerating; the patches are only as good as that run.
 
 ## Applying the bump
 
-Confirm the tag exists and record its multi-architecture index digest:
-
-```sh
-docker buildx imagetools inspect cashubtc/nutshell:<version>
-```
-
-Verify the index contains `linux/amd64` and `linux/arm64`, then:
-
-1. `startos/manifest/index.ts` — set `dockerTag` to `cashubtc/nutshell:<version>@sha256:<digest>`.
-2. `startos/versions/current.ts` — set `version` to `'<version>:0'` and rewrite `releaseNotes`
-   for all five locales. For a wrapper-only change with no upstream move, bump the downstream
-   revision instead (`:0` → `:1`) and leave the image alone. Only spin off a historical version
-   file when a wrapper-owned migration must run in sequence; Nutshell migrates its own database,
-   so a StartOS migration must not duplicate that work. Keep `down: IMPOSSIBLE` unless upstream's
-   schema change is demonstrably reversible.
+1. `docker buildx imagetools inspect cashubtc/nutshell:<version>`: record the index digest and confirm `linux/amd64` is present.
+2. `Dockerfile`: set the `FROM` tag and digest.
+3. `upstream-project/`: check out the same tag.
+4. `patches/`: regenerate as above.
+5. `startos/versions/current.ts`: set `version` to `'<version>:0'` and rewrite `releaseNotes` for all five locales. For a wrapper-only change, bump the downstream revision instead (`:0` → `:1`). Keep `down: IMPOSSIBLE` unless the schema change is demonstrably reversible.
 
 ## Verification
 
 ```sh
 npm ci
 npm test
-npm run test:smoke        # pass the previously packaged image as $1
 make x86
-make arm
 ```
 
-`test:smoke` writes a database with the previously packaged image, migrates it with the newly
-pinned one, and asserts the schema version moved. Its baseline image is an argument, so pass the
-version you are upgrading *from*:
+The image build itself fails if a patch rejects, and it imports the onchain and phoenixd modules as its last step. Then install on a StartOS server with phoenixd (and Fulcrum, for onchain) and drive it: the mint starts, Mint Status reports the seed present, a Lightning deposit and withdrawal settle, and with onchain on, a deposit mints after its confirmations and a withdrawal confirms. For a migration-bearing release, restore a disposable copy of a production-shaped backup and update it first.
+
+Tags are `v<upstream>_<downstream>`. Do not tag until the device test is done.
+
+## Syncing with the fork parent
+
+This repo is a fork of Start9-Community/nutshell-startos. To pick up the parent's changes:
 
 ```sh
-tests/smoke-nutshell.sh cashubtc/nutshell:0.20.3
+git fetch upstream && git merge upstream/master
 ```
 
-Then install on a StartOS server and drive it: the daemon starts, the health check goes green,
-and the Mint Status action reports the seed present. For a migration-bearing release, restore a
-disposable copy of a production-shaped backup, update it, and **exercise a real mint and melt**
-before tagging — a listening port proves the mint is serving, not that it can settle a payment.
-
-Tags are `v<upstream>_<downstream>`. Do not create or push the tag until the device test is done.
+Use the fork parent (`gh api repos/bobodread876/nutcracker-startos --jq .parent.full_name`), never the manifest's `upstreamRepo`, which is Nutshell itself.

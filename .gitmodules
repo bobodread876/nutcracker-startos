@@ -1,0 +1,6 @@
+[submodule "upstream-project"]
+	path = upstream-project
+	url = https://github.com/cashubtc/nutshell.git
+[submodule "admin-ui"]
+	path = admin-ui
+	url = https://github.com/bobodread876/cashu-admin-ui.git

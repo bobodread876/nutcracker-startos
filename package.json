@@ -1,12 +1,12 @@
 {
-  "name": "nutshell-startos",
+  "name": "nutcracker-startos",
   "scripts": {
     "test": "node --test \"tests/**/*.test.ts\"",
     "test:smoke": "bash tests/smoke-nutshell.sh"
   },
   "dependencies": {
-    "@start9labs/start-sdk": "3.0.3",
-    "cln-startos": "github:Start9Labs/cln-startos#next"
+    "@start9labs/start-sdk": "^3.1.1",
+    "phoenixd-startos": "github:Start9-Community/phoenixd-startos#next"
   },
   "overrides": {
     "@start9labs/start-sdk": "$@start9labs/start-sdk"

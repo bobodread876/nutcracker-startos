@@ -12,7 +12,8 @@ import { buildMintEnvironment } from '../startos/mintEnvironment.ts'
  * `UPDATING.md` lists it as one of the things to re-check on every bump.
  */
 
-const clnrest = { address: '10.0.3.1:3010', rune: 'restricted-rune' }
+const phoenixd = { url: 'http://10.0.3.1:9740', password: 'phoenixd-pw' }
+const electrum = { electrumUrl: 'tcp://10.0.3.1:50001' }
 
 const config = {
   mint_info: {
@@ -40,22 +41,76 @@ const config = {
     rate_limit: true,
     rate_limit_per_minute: 120,
   },
+  onchain: {
+    enabled: true,
+    min_amount: 20_000,
+    payout_confirmations: 1,
+    deposit_confirmations: 3,
+    sweep_threshold: 500_000,
+    sweep_min: 50_000,
+    sweep_max_age_hours: 24,
+  },
 }
 
-test('builds a fixed CLNRest environment for StartOS', () => {
-  const env = buildMintEnvironment(config, 'private-key', clnrest)
+test('builds a fixed phoenixd environment for StartOS', () => {
+  const env = buildMintEnvironment(config, 'private-key', phoenixd, null)
 
   assert.equal(env.MINT_DATABASE, '/data/mint')
   assert.equal(env.MINT_LISTEN_HOST, '0.0.0.0')
   assert.equal(env.MINT_LISTEN_PORT, '3338')
-  assert.equal(env.MINT_BACKEND_BOLT11_SAT, 'CLNRestWallet')
-  assert.equal(env.MINT_CLNREST_URL, 'http://10.0.3.1:3010')
-  assert.equal(env.MINT_CLNREST_RUNE, 'restricted-rune')
+  assert.equal(env.MINT_BACKEND_BOLT11_SAT, 'PhoenixdWallet')
+  assert.equal(env.MINT_PHOENIXD_URL, 'http://10.0.3.1:9740')
+  assert.equal(env.MINT_PHOENIXD_API_PASSWORD, 'phoenixd-pw')
+  assert.equal(
+    env.MINT_PHOENIXD_FAILED_SENDS_FILE,
+    '/data/phoenixd-failed-sends.jsonl',
+  )
   assert.equal(env.MINT_PRIVATE_KEY, 'private-key')
+  assert.equal(env.MINT_CLNREST_URL, undefined)
+})
+
+test('sends the fee reserve floor to Nutshell in msat', () => {
+  const env = buildMintEnvironment(config, 'private-key', phoenixd, null)
+  // The operator sets 250 sats; LIGHTNING_RESERVE_FEE_MIN is read in msat.
+  assert.equal(env.LIGHTNING_RESERVE_FEE_MIN, '250000')
+  assert.equal(
+    buildMintEnvironment(null, 'k', phoenixd, null).LIGHTNING_RESERVE_FEE_MIN,
+    '100000',
+  )
+})
+
+test('configures the onchain backend only when switched on and Fulcrum is wired', () => {
+  const env = buildMintEnvironment(config, 'private-key', phoenixd, electrum)
+  const [backend] = JSON.parse(env.MINT_PAYMENT_BACKENDS)
+  assert.equal(backend.method, 'onchain')
+  assert.equal(backend.backend, 'phoenixd')
+  assert.equal(backend.network, 'bitcoin')
+  assert.equal(backend.endpoint, 'http://10.0.3.1:9740')
+  assert.equal(backend.password, 'phoenixd-pw')
+  assert.equal(backend.electrum_url, 'tcp://10.0.3.1:50001')
+  assert.equal(backend.min_amount, 20_000)
+  assert.equal(backend.confirmations, 1)
+  assert.equal(backend.sweep_max_age, 86_400)
+  assert.equal(backend.deposit_wallet.confirmations, 3)
+  assert.equal(
+    backend.deposit_wallet.mnemonic_file,
+    '/data/onchain/deposit.mnemonic',
+  )
+  assert.equal(backend.deposit_wallet.mnemonic, undefined)
+
+  const off = { ...config, onchain: { ...config.onchain, enabled: false } }
+  assert.equal(
+    buildMintEnvironment(off, 'k', phoenixd, electrum).MINT_PAYMENT_BACKENDS,
+    undefined,
+  )
+  assert.equal(
+    buildMintEnvironment(config, 'k', phoenixd, null).MINT_PAYMENT_BACKENDS,
+    undefined,
+  )
 })
 
 test('maps operator settings to current Nutshell environment variables', () => {
-  const env = buildMintEnvironment(config, 'private-key', clnrest)
+  const env = buildMintEnvironment(config, 'private-key', phoenixd, null)
 
   assert.equal(env.MINT_INFO_NAME, 'Sovereign Mint')
   assert.equal(
@@ -95,7 +150,8 @@ test('omits optional values and deprecated variable names', () => {
       },
     },
     'private-key',
-    clnrest,
+    phoenixd,
+    null,
   )
 
   assert.equal(env.MINT_INFO_CONTACT, undefined)
@@ -110,7 +166,7 @@ test('omits optional values and deprecated variable names', () => {
 })
 
 test('keeps upstream rate limiting enabled when no preference is stored', () => {
-  const env = buildMintEnvironment(null, 'private-key', clnrest)
+  const env = buildMintEnvironment(null, 'private-key', phoenixd, null)
 
   assert.equal(env.MINT_RATE_LIMIT, 'true')
   assert.equal(env.MINT_GLOBAL_RATE_LIMIT_PER_MINUTE, '60')
