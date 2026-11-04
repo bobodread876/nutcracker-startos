@@ -29,12 +29,6 @@ away. Check:
   `startos/utils.ts` reports the filename inside it;
 - supported architectures in the image manifest.
 
-Two cross-package claims are worth re-checking on any cln bump rather than a Nutshell one:
-`clnrestPort` is imported from `cln-startos/startos/utils` (so a change there is a build failure
-here), but the `clnrest` host id and the `?rune=` query parameter are read by convention from
-`cln-startos/startos/interfaces.ts`. If cln stops publishing the rune that way, `main.ts` throws
-instead of starting a mint with no Lightning backend — loud, but still a break.
-
 ## Applying the bump
 
 Confirm the tag exists and record its multi-architecture index digest:
@@ -46,34 +40,3 @@ docker buildx imagetools inspect cashubtc/nutshell:<version>
 Verify the index contains `linux/amd64` and `linux/arm64`, then:
 
 1. `startos/manifest/index.ts` — set `dockerTag` to `cashubtc/nutshell:<version>@sha256:<digest>`.
-2. `startos/versions/current.ts` — set `version` to `'<version>:0'` and rewrite `releaseNotes`
-   for all five locales. For a wrapper-only change with no upstream move, bump the downstream
-   revision instead (`:0` → `:1`) and leave the image alone. Only spin off a historical version
-   file when a wrapper-owned migration must run in sequence; Nutshell migrates its own database,
-   so a StartOS migration must not duplicate that work. Keep `down: IMPOSSIBLE` unless upstream's
-   schema change is demonstrably reversible.
-
-## Verification
-
-```sh
-npm ci
-npm test
-npm run test:smoke        # pass the previously packaged image as $1
-make x86
-make arm
-```
-
-`test:smoke` writes a database with the previously packaged image, migrates it with the newly
-pinned one, and asserts the schema version moved. Its baseline image is an argument, so pass the
-version you are upgrading *from*:
-
-```sh
-tests/smoke-nutshell.sh cashubtc/nutshell:0.20.3
-```
-
-Then install on a StartOS server and drive it: the daemon starts, the health check goes green,
-and the Mint Status action reports the seed present. For a migration-bearing release, restore a
-disposable copy of a production-shaped backup, update it, and **exercise a real mint and melt**
-before tagging — a listening port proves the mint is serving, not that it can settle a payment.
-
-Tags are `v<upstream>_<downstream>`. Do not create or push the tag until the device test is done.
