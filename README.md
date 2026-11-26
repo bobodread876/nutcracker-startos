@@ -110,7 +110,7 @@ It is seeded on every init kind by an empty `merge`. Its four groups (`mint_info
 | phoenixd (`phoenixd`) | Yes | `primary` | Creates and settles the Lightning invoices behind every Lightning deposit and withdrawal, and pays onchain withdrawals as splice-outs |
 | Fulcrum (`fulcrum`) | Only while onchain is switched on | `primary` | The Electrum server the deposit wallet and payout checks read the chain from |
 
-**phoenixd** is reached over the service bridge at port 9740. Its full-access `http-password` is not published to dependents, so phoenixd's `main` volume is mounted read-only at `/mnt/phoenixd` and the password is read from `phoenix.conf` on each start. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
+**phoenixd** is reached over the service bridge at port 9740. On each start the mint reads the API password from phoenixd’s read-only `public/full` export. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
 
 **Fulcrum** is reached over the plaintext service bridge at port 50001 (`tcp://`). The dependency is optional and enabled from `onchain.enabled`, so a mint without onchain does not require Fulcrum.
 
@@ -127,7 +127,7 @@ StartOS terminates TLS for both interfaces. The dashboard uses the public Cashu 
 
 ## Installation and First-Run Flow
 
-Install phoenixd first and start it once, so it writes `phoenix.conf`. Then install Nutcracker.
+Install phoenixd first and start it once, so it exports its API password. Then install Nutcracker.
 
 At install the package generates the mint seed and seeds `config.yaml` with defaults; onchain starts switched off. On every start it resolves phoenixd's bridge address, reads its password, builds the environment and launches the mint.
 
@@ -179,7 +179,7 @@ A start that fails before the daemon exists is `main.ts` throwing, and the log s
 
 ## Backups and Restore
 
-Backups cover the mint and its configuration: `sdk.Backups.ofVolumes('main', 'startos')`. The mint seed, the ledger and the deposit phrase are captured together. phoenixd's own volume is mounted read-only and is never part of Nutcracker's backup; phoenixd backs itself up.
+Backups cover the mint and its configuration: `sdk.Backups.ofVolumes('main', 'startos')`. The mint seed, the ledger and the deposit phrase are captured together. phoenixd's exported credential is mounted read-only and is never part of Nutcracker's backup; phoenixd backs itself up.
 
 A restored instance needs nothing re-entered. Init sees the existing seed and does not generate one, and the oneshot sees the existing deposit phrase. phoenixd's and Fulcrum's addresses are resolved fresh on every start.
 
@@ -243,7 +243,7 @@ startos_managed_env_vars:
   - MINT_RATE_LIMIT
   - MINT_GLOBAL_RATE_LIMIT_PER_MINUTE
 dependencies:
-  - phoenixd # required; health check "primary"; main volume mounted read-only
+  - phoenixd # required; health check "primary"; public/full mounted read-only
   - fulcrum # only while onchain is on; health check "primary"
 interfaces:
   api: { type: api, port: 3338 }

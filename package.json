@@ -6,7 +6,7 @@
   },
   "dependencies": {
     "@start9labs/start-sdk": "4.1.0",
-    "phoenixd-startos": "github:Start9-Community/phoenixd-startos#next"
+    "phoenixd-startos": "github:Start9-Community/phoenixd-startos#v0.9.2_4"
   },
   "overrides": {
     "@start9labs/start-sdk": "$@start9labs/start-sdk"

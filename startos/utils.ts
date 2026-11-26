@@ -30,7 +30,7 @@ export const adminUiPort = 3339
 export const adminUiDir = '/opt/admin-ui'
 export const adminUiUser = 'admin'
 
-/** Where phoenixd's main volume (and its phoenix.conf) is mounted, read-only. */
+/** Where phoenixd's exported API credential is mounted, read-only. */
 export const phoenixdMountpoint = '/mnt/phoenixd'
 
 /**
