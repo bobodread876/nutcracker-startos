@@ -26,7 +26,11 @@ RUN pip install --no-cache-dir --require-hashes -r /tmp/bdk-requirements.txt \
     && rm /tmp/bdk-requirements.txt \
     && python -c "import bdkpython, cashu.payment.onchain_phoenixd, cashu.lightning.phoenixd"
 
-# The admin dashboard, run by its own daemon with the mint volume read-only.
+# The dashboard reads only the published statistics snapshot.
 COPY --from=admin-ui /usr/local/bin/node /usr/local/bin/node
 COPY --from=admin-ui /opt/admin-ui /opt/admin-ui
-RUN node --version && node -e "require('node:sqlite'); require('/opt/admin-ui/node_modules/express')"
+COPY dashboard/export_stats.py /opt/nutcracker/export_stats.py
+COPY dashboard/summary.cjs /opt/admin-ui/summary.cjs
+COPY dashboard/admin-ui.patch /tmp/admin-ui.patch
+RUN patch --batch --fuzz=0 -d /opt/admin-ui -p1 < /tmp/admin-ui.patch && rm /tmp/admin-ui.patch \
+    && node -e "require('/opt/admin-ui/node_modules/express')"

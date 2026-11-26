@@ -6,7 +6,6 @@ import { i18n } from './i18n'
 import {
   buildMintEnvironment,
   DEPOSIT_MNEMONIC_FILE,
-  MINT_DATABASE,
   MINT_PORT,
   ONCHAIN_DIR,
   OnchainConnection,
@@ -152,40 +151,69 @@ export const main = sdk.setupMain(async ({ effects }) => {
     requires: onchain ? ['deposit-wallet'] : [],
   })
 
-  // The admin dashboard: read-only, so it sees the mint's volume read-only.
   // Skipped until Set Admin Password has run; the task says so.
-  return withMint.addDaemon('admin-ui', () =>
+  const statsMount = {
+    volumeId: 'stats',
+    subpath: null,
+    mountpoint: '/stats',
+  } as const
+  const withStats = withMint.addDaemon('stats', () =>
     adminPasswordHash
       ? {
           subcontainer: sdk.SubContainer.of(
             effects,
             { imageId: 'main' },
-            // The seed, deposit wallet and config stay read-only. The database
-            // folder is writable because SQLite creates its -wal and -shm files
-            // beside an idle WAL database even for a read-only connection; the
-            // dashboard still opens the database itself read-only.
             sdk.Mounts.of()
-              .mountVolume({
-                volumeId: 'main',
-                subpath: null,
-                mountpoint: '/data',
-                readonly: true,
-              })
+              // SQLite may create WAL sidecars even on a read-only connection.
               .mountVolume({
                 volumeId: 'main',
                 subpath: mintDatabaseDir,
-                mountpoint: MINT_DATABASE,
+                mountpoint: '/ledger',
                 readonly: false,
-              }),
+              })
+              .mountVolume({ ...statsMount, readonly: false }),
+            'stats-sub',
+          ),
+          exec: { command: ['python', '/opt/nutcracker/export_stats.py'] },
+          ready: {
+            display: i18n('Dashboard statistics'),
+            fn: async () => {
+              const timestamp = await sdk.volumes.stats
+                .readFile('summary.json', 'utf-8')
+                .then((data) => JSON.parse(String(data)).timestamp)
+                .catch(() => 0)
+              const age = Date.now() / 1000 - timestamp
+              return age >= 0 && age <= 65
+                ? {
+                    result: 'success',
+                    message: i18n('Dashboard statistics are current'),
+                  }
+                : {
+                    result: 'failure',
+                    message: i18n('Waiting for current mint statistics'),
+                  }
+            },
+          },
+          requires: ['primary'],
+        }
+      : null,
+  )
+  return withStats.addDaemon('admin-ui', () =>
+    adminPasswordHash
+      ? {
+          subcontainer: sdk.SubContainer.of(
+            effects,
+            { imageId: 'main' },
+            sdk.Mounts.of().mountVolume({ ...statsMount, readonly: true }),
             'admin-ui-sub',
           ),
           exec: {
             command: ['node', `${adminUiDir}/server.js`],
+            user: 'nobody',
             env: {
               PORT: String(adminUiPort),
               HOST: '0.0.0.0',
               MINT_URL: `http://127.0.0.1:${MINT_PORT}`,
-              MINT_DB_PATH: `${MINT_DATABASE}/mint.sqlite3`,
               ADMIN_USER: adminUiUser,
               ADMIN_PASS_HASH: adminPasswordHash,
             },

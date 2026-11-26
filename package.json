@@ -1,7 +1,7 @@
 {
   "name": "nutcracker-startos",
   "scripts": {
-    "test": "node --test \"tests/**/*.test.ts\"",
+    "test": "node --test \"tests/**/*.test.ts\" && python3 -B tests/test_dashboard_stats.py",
     "test:smoke": "bash tests/smoke-nutshell.sh"
   },
   "dependencies": {

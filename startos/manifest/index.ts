@@ -10,7 +10,7 @@ export const manifest = setupManifest({
   marketingUrl: 'https://cashu.space',
   donationUrl: null,
   description: { short, long },
-  volumes: ['main', 'startos'],
+  volumes: ['main', 'startos', 'stats'],
   images: {
     main: {
       // Built by ./Dockerfile: the digest-pinned official Nutshell image, with

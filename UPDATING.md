@@ -8,7 +8,7 @@ Nutcracker builds `./Dockerfile`: the official `cashubtc/nutshell` image, digest
 | Submodule commit at the same tag | `upstream-project/` (`git -C upstream-project checkout <tag>`) |
 | The patches, regenerated against that tag | `patches/` |
 
-The admin dashboard moves independently: `admin-ui/` (submodule of bobodread876/cashu-admin-ui) and the `node:22-bookworm-slim` digest in the Dockerfile's first stage. Bump the digest with `docker buildx imagetools inspect node:22-bookworm-slim`; the build fails if `node:sqlite` or the dashboard's dependencies do not load.
+The admin dashboard moves independently: `admin-ui/` (submodule of bobodread876/cashu-admin-ui) and the `node:22-bookworm-slim` digest in the Dockerfile's first stage. `dashboard/admin-ui.patch` applies to the pinned `admin-ui` commit; recheck balances, quote totals and authenticated metrics when moving that pin. Bump the digest with `docker buildx imagetools inspect node:22-bookworm-slim`; the build fails if `node:sqlite` or the dashboard's dependencies do not load.
 
 The GitHub stable release is the source of truth: `gh release view -R cashubtc/nutshell --json tagName,publishedAt,url`. Ignore prereleases.
 

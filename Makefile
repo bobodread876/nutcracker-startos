@@ -3,4 +3,4 @@ ARCHES := x86 arm
 TS_CHECK := npx tsc --noEmit && npm test
 include node_modules/@start9labs/start-sdk/s9pk.mk
 
-javascript/index.js: Makefile $(wildcard tests/*.test.ts)
+javascript/index.js: Makefile $(wildcard tests/*.test.ts) tests/test_dashboard_stats.py dashboard/export_stats.py
