@@ -107,6 +107,9 @@ export default {
     102: 'Establece una contraseña para iniciar sesión en el panel de administración.',
     103: 'El panel de administración está listo',
     104: 'El panel de administración no responde',
+    105: 'Estadísticas del panel',
+    106: 'Las estadísticas del panel están actualizadas',
+    107: 'Esperando las estadísticas actuales de la casa de moneda',
   },
   de_DE: {
     0: 'Nutcracker wird gestartet',
@@ -214,6 +217,9 @@ export default {
     102: 'Lege ein Passwort fest, um dich am Admin-Dashboard anzumelden.',
     103: 'Das Admin-Dashboard ist bereit',
     104: 'Das Admin-Dashboard antwortet nicht',
+    105: 'Dashboard-Statistiken',
+    106: 'Die Dashboard-Statistiken sind aktuell',
+    107: 'Warten auf aktuelle Mint-Statistiken',
   },
   pl_PL: {
     0: 'Uruchamianie Nutcracker',
@@ -321,6 +327,9 @@ export default {
     102: 'Ustaw hasło, aby zalogować się do panelu administracyjnego.',
     103: 'Panel administracyjny jest gotowy',
     104: 'Panel administracyjny nie odpowiada',
+    105: 'Statystyki panelu',
+    106: 'Statystyki panelu są aktualne',
+    107: 'Oczekiwanie na aktualne statystyki mennicy',
   },
   fr_FR: {
     0: 'Démarrage de Nutcracker',
@@ -428,5 +437,8 @@ export default {
     102: "Définissez un mot de passe pour vous connecter au tableau de bord d'administration.",
     103: "Le tableau de bord d'administration est prêt",
     104: "Le tableau de bord d'administration ne répond pas",
+    105: 'Statistiques du tableau de bord',
+    106: 'Les statistiques du tableau de bord sont à jour',
+    107: 'En attente des statistiques actuelles de la monnaie',
   },
 } satisfies Record<string, LangDict>

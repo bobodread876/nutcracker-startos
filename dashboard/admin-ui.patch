@@ -1,0 +1,365 @@
+--- a/server.js
++++ b/server.js
+@@ -2,12 +2,12 @@
+  * Cashu Nutshell Admin UI — Server
+  *
+  * A read-only monitoring dashboard for Cashu Nutshell mints. It proxies the
+- * mint's public /v1/* API and reads the mint's SQLite database read-only for
++ * mint's public /v1/* API and reads the collector's aggregate snapshot for
+  * balances and quote statistics. It changes nothing on the mint.
+  *
+  * Architecture:
+  *   Browser (SPA) <-HTTP/WS-> Express server <-HTTP-> Nutshell mint /v1/*
+- *                                            <-read-only-> mint.sqlite3
++ *                                            <-read-only-- summary.json
+  *
+  * Environment variables follow Nutshell's naming conventions where
+  * possible (MINT_ prefix for mint-related config). See .env.example.
+@@ -32,79 +32,7 @@
+ const promClient = require('prom-client');
+
+ // ---------------------------------------------------------------------------
+-// SQLite — direct database inspection (read-only, node:sqlite)
+-// ---------------------------------------------------------------------------
+-// Nutshell's SQLite database is opened read-only with Node's built-in driver
+-// (Node 22.13+), one short-lived connection per query. Every statement is a
+-// constant SELECT; values such as time windows are bound as parameters.
+-// Nutshell runs SQLite in WAL mode, which a read-only connection can read as
+-// long as the mint's -wal and -shm files exist (they do while it runs).
+-// The database path comes from MINT_DB_PATH (Nutshell's MINT_DATABASE/mint.sqlite3).
+-
+-let DatabaseSync = null;
+-try {
+-  ({ DatabaseSync } = require('node:sqlite'));
+-} catch {
+-  DatabaseSync = null;
+-}
+-
+-/** @returns {boolean} whether this Node.js build has node:sqlite. */
+-function hasSqlite() {
+-  return DatabaseSync !== null;
+-}
+-
+-// The last SQLite error, logged once per distinct message so a persistent
+-// failure shows up in the logs without repeating on every poll.
+-let lastDbError = null;
+-
+-function noteDbError(message) {
+-  if (message === lastDbError) return;
+-  lastDbError = message;
+-  if (message) {
+-    console.error(`[admin-ui] SQLite: ${message}`);
+-    addLog('error', 'db', `SQLite: ${message}`);
+-  }
+-}
+-
+-/** Run fn(db) on a read-only connection; returns null on any error. */
+-function withDb(dbPath, fn) {
+-  let db = null;
+-  try {
+-    db = new DatabaseSync(dbPath, { readOnly: true });
+-    const result = fn(db);
+-    noteDbError(null);
+-    return result;
+-  } catch (error) {
+-    noteDbError(error.message);
+-    return null;
+-  } finally {
+-    try { db && db.close(); } catch { /* ignored */ }
+-  }
+-}
+-
+-/** Single scalar from a SELECT, or null. */
+-function sqliteQuery(dbPath, sql, params = []) {
+-  return withDb(dbPath, (db) => {
+-    const row = db.prepare(sql).get(...params);
+-    if (!row) return null;
+-    const value = Object.values(row)[0];
+-    return value === null || value === undefined ? null : Number(value);
+-  });
+-}
+-
+-/** key → number map from a two-column SELECT (GROUP BY count or sum). */
+-function sqliteGroupBy(dbPath, sql, params = []) {
+-  return withDb(dbPath, (db) => {
+-    const out = {};
+-    for (const row of db.prepare(sql).all(...params)) {
+-      const [key, value] = Object.values(row);
+-      if (key !== null && key !== undefined && value !== null) out[String(key)] = Number(value);
+-    }
+-    return out;
+-  }) || {};
+-}
+-
+-const sqliteGroupBySum = sqliteGroupBy;
++const { readSummary } = require('./summary.cjs');
+
+ const app = express();
+ const server = http.createServer(app);
+@@ -126,9 +54,6 @@
+   adminPassHash: process.env.ADMIN_PASS_HASH || '',
+   adminPass: process.env.ADMIN_PASS || '',
+   authType: process.env.AUTH_TYPE || 'basic',  // 'basic' or 'none'
+-  // Path to Nutshell's SQLite file (MINT_DATABASE/mint.sqlite3). Set
+-  // MINT_DB_PATH to enable balances and database statistics. Opened read-only.
+-  mintDbPath: process.env.MINT_DB_PATH || ''
+ };
+
+ // ---------------------------------------------------------------------------
+@@ -283,182 +208,27 @@
+ }
+
+ // ---------------------------------------------------------------------------
+-// Database Stats Helper
+-// ---------------------------------------------------------------------------
+-// Reads Nutshell's SQLite database directly (read-only) to return entry
+-// counts for all core tables. This addresses the exact bounty requirement
+-// for "number of entries in the database".
+-//
+-// Nutshell DB schema (cashu/mint/db/crud.py, cashu/mint/db/db.py):
+-//   mint_quotes   — NUT-04 mint quotes (states: UNPAID, PAID, ISSUED, EXPIRED)
+-//   melt_quotes   — NUT-05 melt quotes (states: UNPAID, PENDING, PAID)
+-//   proofs        — Spent proofs (redeemed tokens, double-spend prevention)
+-//   outputs       — Blind signatures issued (promises to token holders)
+-//   keysets       — Keyset history (active + retired keysets)
+-//
+-// Returns null if MINT_DB_PATH is not configured or the file doesn't exist.
+-
+-/** Why the mint database can't be read, or null when it can. */
+-function dbUnavailableReason() {
+-  if (!CONFIG.mintDbPath) {
+-    return 'MINT_DB_PATH is not set. Set it to the path of the mint\'s mint.sqlite3 file.';
+-  }
+-  if (!fs.existsSync(CONFIG.mintDbPath)) {
+-    return `Database file not found: ${CONFIG.mintDbPath}`;
+-  }
+-  if (!hasSqlite()) {
+-    return 'This Node.js has no node:sqlite. Use Node.js 22.13 or newer.';
+-  }
+-  if (withDb(CONFIG.mintDbPath, (db) => db.prepare('SELECT 1').get()) === null) {
+-    return `Cannot open ${CONFIG.mintDbPath}: ${lastDbError}`;
+-  }
+-  return null;
++// The dashboard sees only the collector's aggregate summary.
++function getDbStats(summary = readSummary()) {
++  dbEntryCount.reset();
++  dbQuotesByState.reset();
++  if (!summary) return { available: false, reason: 'Waiting for current mint statistics.' };
++  const { tables, timestamp, requestsLast1h, requestsLast24h } = summary;
++  for (const [table, stats] of Object.entries(tables)) {
++    const label = { mintQuotes: 'mint_quotes', meltQuotes: 'melt_quotes' }[table] || table;
++    dbEntryCount.set({ table: label }, stats.total);
++  }
++  for (const [type, quotes] of [['mint', tables.mintQuotes], ['melt', tables.meltQuotes]]) {
++    for (const [state, count] of Object.entries(quotes.byState)) {
++      dbQuotesByState.set({ quote_type: type, state }, count);
++    }
++  }
++  return { available: true, dbPath: 'Mint statistics summary', tables, timestamp, requestsLast1h, requestsLast24h };
+ }
+
+-function getDbStats() {
+-  const reason = dbUnavailableReason();
+-  if (reason) return { available: false, reason };
+-
+-  try {
+-    const now = Math.floor(Date.now() / 1000);
+-    const since24h = now - 86400;
+-    const since1h  = now - 3600;
+-
+-    const p = CONFIG.mintDbPath;
+-
+-    // ---- mint_quotes (NUT-04) ----
+-    const mintTotal   = sqliteQuery(p, 'SELECT COUNT(*) FROM mint_quotes');
+-    const mintStates  = sqliteGroupBy(p, 'SELECT state, COUNT(*) FROM mint_quotes GROUP BY state');
+-    const mintLast24h = sqliteQuery(p, 'SELECT COUNT(*) FROM mint_quotes WHERE created_time > ?', [since24h]);
+-    const mintLast1h  = sqliteQuery(p, 'SELECT COUNT(*) FROM mint_quotes WHERE created_time > ?', [since1h]);
+-
+-    // ---- melt_quotes (NUT-05) ----
+-    const meltTotal   = sqliteQuery(p, 'SELECT COUNT(*) FROM melt_quotes');
+-    const meltStates  = sqliteGroupBy(p, 'SELECT state, COUNT(*) FROM melt_quotes GROUP BY state');
+-    const meltLast24h = sqliteQuery(p, 'SELECT COUNT(*) FROM melt_quotes WHERE created_time > ?', [since24h]);
+-    const meltLast1h  = sqliteQuery(p, 'SELECT COUNT(*) FROM melt_quotes WHERE created_time > ?', [since1h]);
+-
+-    // ---- proofs (spent tokens / double-spend prevention list) ----
+-    const proofsTotal = sqliteQuery(p, 'SELECT COUNT(*) FROM proofs_used');
+-
+-    // ---- outputs / promises (blind signatures issued) ----
+-    // Nutshell uses "outputs" in newer versions, "promises" in some older builds
+-    const outputsTotal = sqliteQuery(p, 'SELECT COUNT(*) FROM promises WHERE c_ IS NOT NULL');
+-
+-    // ---- keysets ----
+-    const keysetsTotal  = sqliteQuery(p, 'SELECT COUNT(*) FROM keysets');
+-    const keysetsActive = sqliteQuery(p, 'SELECT COUNT(*) FROM keysets WHERE active = 1');
+-
+-    // Update Prometheus gauges
+-    if (mintTotal   !== null) dbEntryCount.set({ table: 'mint_quotes' }, mintTotal);
+-    if (meltTotal   !== null) dbEntryCount.set({ table: 'melt_quotes' }, meltTotal);
+-    if (proofsTotal !== null) dbEntryCount.set({ table: 'proofs' },      proofsTotal);
+-    if (outputsTotal !== null) dbEntryCount.set({ table: 'outputs' },    outputsTotal);
+-    if (keysetsTotal !== null) dbEntryCount.set({ table: 'keysets' },    keysetsTotal);
+-
+-    Object.entries(mintStates).forEach(([state, n]) => dbQuotesByState.set({ quote_type: 'mint', state }, n));
+-    Object.entries(meltStates).forEach(([state, n]) => dbQuotesByState.set({ quote_type: 'melt', state }, n));
+-
+-    return {
+-      available: true,
+-      dbPath: CONFIG.mintDbPath,
+-      tables: {
+-        mintQuotes: {
+-          total: mintTotal,
+-          byState: mintStates,
+-          last24h: mintLast24h,
+-          last1h:  mintLast1h,
+-          note: 'NUT-04 mint operations'
+-        },
+-        meltQuotes: {
+-          total: meltTotal,
+-          byState: meltStates,
+-          last24h: meltLast24h,
+-          last1h:  meltLast1h,
+-          note: 'NUT-05 melt operations'
+-        },
+-        proofs: {
+-          total: proofsTotal,
+-          note: 'Spent proofs (double-spend prevention)'
+-        },
+-        outputs: {
+-          total: outputsTotal,
+-          note: 'Blind signatures issued (promises to token holders)'
+-        },
+-        keysets: {
+-          total:  keysetsTotal,
+-          active: keysetsActive
+-        }
+-      },
+-      requestsLast24h: (mintLast24h ?? 0) + (meltLast24h ?? 0),
+-      requestsLast1h:  (mintLast1h  ?? 0) + (meltLast1h  ?? 0),
+-      timestamp: now
+-    };
+-
+-  } catch (error) {
+-    addLog('error', 'admin', `DB stats error: ${error.message}`);
+-    return { available: false, reason: `Query error: ${error.message}` };
+-  }
+-}
+-
+-// ---------------------------------------------------------------------------
+-// Mint Balances Helper
+-// ---------------------------------------------------------------------------
+-// Computes outstanding eCash per unit from the Nutshell SQLite database.
+-//
+-// Cashu eCash accounting:
+-//   outputs table  = all blind signatures ever issued  (total eCash created)
+-//   proofs table   = all tokens spent/redeemed         (eCash returned to mint)
+-//   outstanding    = SUM(outputs.amount) - SUM(proofs.amount), grouped by unit
+-//
+-// Unit conventions:
+-//   sat   — satoshis (integers)
+-//   msat  — millisatoshis (integers)
+-//   usd   — US cents (divide by 100 to get dollars)
+-//   eur   — Euro cents (divide by 100 to get euros)
+-
+-/**
+- * Compute outstanding eCash balance per unit.
+- * Returns { available: false } when DB is not configured or accessible.
+- *
+- * @returns {{ available: boolean, balances?: Object.<string, {outstanding: number, issued: number, redeemed: number, unit: string}> }}
+- */
+-function getMintBalances() {
+-  const reason = dbUnavailableReason();
+-  if (reason) return { available: false, reason };
+-  try {
+-    const p = CONFIG.mintDbPath;
+-
+-    // Total issued per unit — all blind signatures ever created
+-    const issued = sqliteGroupBySum(p,
+-      // Nutshell's own view: blind signatures issued, per keyset
+-      'SELECT k.unit, SUM(b.balance) FROM balance_issued b JOIN keysets k ON b.keyset = k.id GROUP BY k.unit'
+-    );
+-
+-    // Total redeemed per unit — tokens that have been spent back to the mint
+-    const spent = sqliteGroupBySum(p,
+-      // Nutshell's own view: proofs spent back to the mint, per keyset
+-      'SELECT k.unit, SUM(b.balance) FROM balance_redeemed b JOIN keysets k ON b.keyset = k.id GROUP BY k.unit'
+-    );
+-
+-    const units = new Set([...Object.keys(issued), ...Object.keys(spent)]);
+-    const balances = {};
+-    for (const unit of units) {
+-      const totalIssued = issued[unit] || 0;
+-      const totalSpent = spent[unit] || 0;
+-      balances[unit] = {
+-        outstanding: totalIssued - totalSpent,
+-        issued: totalIssued,
+-        redeemed: totalSpent,
+-        unit
+-      };
+-    }
+-
+-    return { available: true, balances };
+-  } catch (error) {
+-    addLog('error', 'admin', `getMintBalances error: ${error.message}`);
+-    return { available: false, reason: error.message };
+-  }
++function getMintBalances(summary = readSummary()) {
++  return summary ? { available: true, balances: summary.balances }
++                 : { available: false, reason: 'Waiting for current mint statistics.' };
+ }
+
+ // ---------------------------------------------------------------------------
+@@ -713,12 +483,9 @@
+     // Collect host-level OS stats
+     const osStats = getOsStats();
+
+-    // Collect database stats (read-only SQLite inspection)
+-    // This is the "number of entries in the database" bounty requirement
+-    const dbStats = getDbStats();
+-
+-    // Compute outstanding eCash per unit (sat/usd/etc.)
+-    const balances = getMintBalances();
++    const summary = readSummary();
++    const dbStats = getDbStats(summary);
++    const balances = getMintBalances(summary);
+
+     res.json({
+       mintInfo: info.data,
+@@ -731,7 +498,7 @@
+       config: {
+         mintUrl: CONFIG.mintUrl,
+         authType: CONFIG.authType,
+-        dbConfigured: !!CONFIG.mintDbPath
++        dbConfigured: true
+       }
+     });
+   } catch (error) {
+@@ -838,6 +605,7 @@
+  */
+ app.get('/metrics', requireAuth, async (req, res) => {
+   try {
++    getDbStats();  // Refresh aggregate gauges before scrape
+     getOsStats();  // Refresh OS gauges before scrape
+     res.set('Content-Type', register.contentType);
+     res.end(await register.metrics());
+--- a/public/index.html
++++ b/public/index.html
+@@ -439,8 +439,8 @@
+           <div class="card">
+             <div class="card-body" style="text-align:center; padding: 40px;">
+               <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.3; margin-bottom:16px;"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+-              <p style="font-size: 1.1em; margin-bottom: 8px;">Database path not configured</p>
+-              <p style="opacity:0.5; font-size: 0.9em;">The mint database could not be read. The Logs page shows the SQLite error.</p>
++              <p style="font-size: 1.1em; margin-bottom: 8px;">Mint statistics unavailable</p>
++              <p>Waiting for a current summary from the mint.</p>
+             </div>
+           </div>
+         </div>
+@@ -597,7 +597,7 @@
+                     <span class="info-value" id="dbp-outputs-count">--</span>
+                   </div>
+                 </div>
+-                <p class="db-path-label">Data path: <span id="dbp-path">--</span></p>
++                <p class="db-path-label">Source: <span id="dbp-path">--</span></p>
+               </div>
+             </div>
+           </div>

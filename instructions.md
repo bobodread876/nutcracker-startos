@@ -54,7 +54,7 @@ The deposit wallet is a hot wallet on this server. Its recovery phrase is stored
 
 ### The admin dashboard
 
-Open the **Admin Dashboard** interface and sign in as `admin` with the password from *Set Admin Password*. It shows outstanding eCash per unit, quote counts, keysets, the mint's health and the server's load. It only reads: mint settings are changed through the actions below.
+Open the **Admin Dashboard** interface and sign in as `admin` with the password from *Set Admin Password*. Statistics refresh every 30 seconds. It shows outstanding eCash per unit, quote counts, keysets, the mint's health and the server's load. It only reads: mint settings are changed through the actions below.
 
 ### Actions
 

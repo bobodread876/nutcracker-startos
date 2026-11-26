@@ -57,6 +57,8 @@ npm test
 make x86
 ```
 
+The dashboard adapter in `dashboard/admin-ui.patch` applies to the pinned admin-ui submodule. Recheck balances, quote totals and authenticated metrics when changing that pin.
+
 The image build itself fails if a patch rejects, and it imports the onchain and phoenixd modules as its last step. Then install on a StartOS server with phoenixd (and Fulcrum, for onchain) and drive it: the mint starts, Mint Status reports the seed present, a Lightning deposit and withdrawal settle, and with onchain on, a deposit mints after its confirmations and a withdrawal confirms. For a migration-bearing release, restore a disposable copy of a production-shaped backup and update it first.
 
 Tags are `v<upstream>_<downstream>`. Do not tag until the device test is done.
