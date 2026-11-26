@@ -6,7 +6,7 @@
 
 > Nutcracker is a fork of [Start9-Community/nutshell-startos](https://github.com/Start9-Community/nutshell-startos). Anything not listed in this document behaves as upstream Nutshell does, and the upstream documentation applies. See the Documentation section of `instructions.md` for links.
 
-[Nutshell](https://github.com/cashubtc/nutshell) is a Cashu mint: a server that issues and redeems Chaumian eCash backed by bitcoin. Nutcracker runs Nutshell 0.22.1 with patches upstream has not shipped: the payment-method abstraction, the NUT-30 onchain plugin, a phoenixd Lightning backend, and onchain payouts and deposits through phoenixd. Lightning settles through the operator's phoenixd node; onchain, when switched on, reads the chain from the operator's Fulcrum server. A read-only admin dashboard ([cashu-admin-ui](https://github.com/bobodread876/cashu-admin-ui)) runs beside the mint.
+[Nutshell](https://github.com/cashubtc/nutshell) is a Cashu mint: a server that issues and redeems Chaumian eCash backed by bitcoin. Nutcracker runs Nutshell with patches upstream has not shipped: the payment-method abstraction, the NUT-30 onchain plugin, a phoenixd Lightning backend, and onchain payouts and deposits through phoenixd. Lightning settles through the operator's phoenixd node; onchain, when switched on, reads the chain from the operator's Fulcrum server. A read-only admin dashboard ([cashu-admin-ui](https://github.com/bobodread876/cashu-admin-ui)) runs beside the mint.
 
 - **Upstream repo:** <https://github.com/cashubtc/nutshell>
 - **Wrapper repo:** <https://github.com/bobodread876/nutcracker-startos>
@@ -38,10 +38,10 @@ The official Nutshell image with Nutcracker's patches applied, built by `./Docke
 
 | Property     | Value                                                                 |
 | ------------ | --------------------------------------------------------------------- |
-| Base image   | `cashubtc/nutshell:0.22.1`, digest-pinned                             |
-| Source       | `upstream-project/` submodule at tag `0.22.1`, then `patches/*.patch` |
-| Extra        | `bdkpython==0.32.1`, hash-pinned in `bdk-requirements.txt`            |
-| Dashboard    | `admin-ui/` submodule, with Node 22 from a digest-pinned `node:22-bookworm-slim` build stage |
+| Base image   | `cashubtc/nutshell`, digest-pinned                             |
+| Source       | `upstream-project/` submodule at the corresponding upstream tag, then `patches/*.patch` |
+| Extra        | `bdkpython`, hash-pinned in `bdk-requirements.txt`            |
+| Dashboard    | `admin-ui/` submodule, with Node from the digest-pinned build stage in the Dockerfile |
 | Architecture | x86_64                                                                |
 | Command      | `poetry run mint`                                                     |
 
@@ -49,7 +49,8 @@ The official Nutshell image with Nutcracker's patches applied, built by `./Docke
 | -------------------- | -------------------------------------------------------------------- |
 | `nutcracker-sub`     | The `primary` daemon, the one to `attach` to                         |
 | `deposit-wallet-sub` | The `deposit-wallet` oneshot, present only while onchain is switched on |
-| `admin-ui-sub`       | The `admin-ui` daemon (the dashboard), present once an admin password is set; mounts `main` read-only, with only the database folder `mint/` writable |
+| `stats-sub` | Reads the live WAL ledger and writes aggregate statistics whenever the dashboard is enabled. |
+| `admin-ui-sub`       | The `admin-ui` daemon (the dashboard), present once an admin password is set; mounts only the read-only `stats` volume |
 
 The build copies Nutshell's source from the submodule over the image's `/app/cashu` (the two are identical at the pinned tag), applies the patches, and installs `bdkpython`. The image's own dependencies are left as upstream built them. Every setting this package controls is passed as environment on each start.
 
@@ -73,7 +74,8 @@ Two volumes.
 
 | Volume | Mount Point | Purpose |
 | ------ | ----------- | ------- |
-| `main` | `/data` (read/write for the mint; read-only for the dashboard except `mint/`) | The mint database, the mint seed, the deposit wallet, and this package's settings |
+| `main` | `/data` (mint only) | The mint database, the mint seed, the deposit wallet, and this package's settings |
+| `stats` | `/stats` | Derived statistics. The collector writes here and the dashboard reads here. |
 | `startos` | not mounted | `store.json`: the admin dashboard password, as a scrypt hash only |
 
 | Path | Written by | Holds |
@@ -105,10 +107,10 @@ It is seeded on every init kind by an empty `merge`. Its four groups (`mint_info
 
 | Dependency | Required | Health checks | Why |
 | ---------- | -------- | ------------- | --- |
-| phoenixd (`phoenixd`) | Yes, `>=0.9.2:2` | `primary` | Creates and settles the Lightning invoices behind every Lightning deposit and withdrawal, and pays onchain withdrawals as splice-outs |
-| Fulcrum (`fulcrum`) | Only while onchain is switched on, `>=2.1.4:0` | `primary` | The Electrum server the deposit wallet and payout checks read the chain from |
+| phoenixd (`phoenixd`) | Yes | `primary` | Creates and settles the Lightning invoices behind every Lightning deposit and withdrawal, and pays onchain withdrawals as splice-outs |
+| Fulcrum (`fulcrum`) | Only while onchain is switched on | `primary` | The Electrum server the deposit wallet and payout checks read the chain from |
 
-**phoenixd** is reached over the service bridge at port 9740. Its full-access `http-password` is not published to dependents, so phoenixd's `main` volume is mounted read-only at `/mnt/phoenixd` and the password is read from `phoenix.conf` on each start. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
+**phoenixd** is reached over the service bridge at port 9740. On each start the mint reads the API password from phoenixd’s read-only `public/full` export. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
 
 **Fulcrum** is reached over the plaintext service bridge at port 50001 (`tcp://`). The dependency is optional and enabled from `onchain.enabled`, so a mint without onchain does not require Fulcrum.
 
@@ -121,11 +123,11 @@ The host ids and ports are inlined in `startos/utils.ts`. Importing them from `p
 | Cashu Mint API | `api` | api | 3338 | The Cashu API wallets connect to |
 | Admin Dashboard | `admin` | ui | 3339 | The read-only dashboard; signs in with the Set Admin Password login |
 
-Both speak plain HTTP inside the container; StartOS terminates TLS and owns every external address. The dashboard reaches the mint at `127.0.0.1:3338` and opens `mint.sqlite3` with a read-only connection. The rest of `main`, including the seed and the deposit wallet, is mounted read-only. The database folder is mounted writable because the mint closes its SQLite connections when idle, which removes the `-wal` and `-shm` files, and a read-only connection to a WAL database cannot open until those files exist; a writable folder lets SQLite create them. The dashboard changes nothing on the mint: no settings, quotes or keysets. If it cannot read the database, the reason is shown on the dashboard and logged as `SQLite: ...` in Nutcracker's logs.
+StartOS terminates TLS for both interfaces. The dashboard uses the public Cashu API for public mint information. A separate collector opens the mint ledger in SQLite read-only mode and publishes a JSON summary to the dedicated `stats` volume every 30 seconds. It includes quote counts and time windows, spent proof and signed output counts, keyset counts, and total issued and redeemed amounts per unit. The dashboard runs as the unprivileged `nobody` user and mounts only this volume, read-only. The Graphite & Ember overview shows balances by unit and 24-hour quote counts. The Pulse Health tab reports mint reachability separately from snapshot age and exposes the detailed diagnostics. The open dashboard hides expired figures, retries automatically and shows the time of the most recent reading. The browser uses a tab-scoped, eight-hour session. Signing out or changing the dashboard password revokes access, including live updates. Authenticated monitoring clients can still use HTTP Basic authentication.
 
 ## Installation and First-Run Flow
 
-Install phoenixd first and start it once, so it writes `phoenix.conf`. Then install Nutcracker.
+Install phoenixd first and start it once, so it exports its API password. Then install Nutcracker.
 
 At install the package generates the mint seed and seeds `config.yaml` with defaults; onchain starts switched off. On every start it resolves phoenixd's bridge address, reads its password, builds the environment and launches the mint.
 
@@ -170,13 +172,14 @@ Read-only, any status. Reports whether the mint seed and the deposit phrase exis
 | Check | Displayed | Method |
 | ----- | --------- | ------ |
 | `primary` | "Cashu Mint" | Port 3338 is listening |
+| `stats` | "Dashboard statistics" | The summary is current (once an admin password is set). |
 | `admin-ui` | "Admin Dashboard" | `GET /health` on 3339 answers (once a password is set) |
 
 A start that fails before the daemon exists is `main.ts` throwing, and the log says why: phoenixd unreachable, phoenixd's password unreadable, or onchain switched on with Fulcrum unreachable. A listening port proves the mint is serving, not that it can settle; only a real deposit and withdrawal prove the payment paths.
 
 ## Backups and Restore
 
-Both volumes are copied: `sdk.Backups.ofVolumes('main', 'startos')`. The mint seed, the ledger and the deposit phrase are captured together. phoenixd's own volume is mounted read-only and is never part of Nutcracker's backup; phoenixd backs itself up.
+Backups cover the mint and its configuration: `sdk.Backups.ofVolumes('main', 'startos')`. The mint seed, the ledger and the deposit phrase are captured together. phoenixd's exported credential is mounted read-only and is never part of Nutcracker's backup; phoenixd backs itself up.
 
 A restored instance needs nothing re-entered. Init sees the existing seed and does not generate one, and the oneshot sees the existing deposit phrase. phoenixd's and Fulcrum's addresses are resolved fresh on every start.
 
@@ -198,13 +201,14 @@ A stale backup cannot be fixed by restoring it: eCash issued after the backup is
 
 ```yaml
 package_id: nutcracker
-image: built from ./Dockerfile # cashubtc/nutshell:0.22.1 digest-pinned + patches/
+image: built from ./Dockerfile # cashubtc/nutshell digest-pinned + patches/
 architectures:
   - x86_64
 subcontainers:
   - nutcracker-sub # primary daemon
   - deposit-wallet-sub # oneshot, only while onchain is on
-  - admin-ui-sub # dashboard daemon, main read-only except mint/
+  - stats-sub # collector, mounts the ledger directory and stats
+  - admin-ui-sub # dashboard, mounts only stats read-only
 volumes:
   main: /data
   startos: unmounted # store.json
@@ -239,7 +243,7 @@ startos_managed_env_vars:
   - MINT_RATE_LIMIT
   - MINT_GLOBAL_RATE_LIMIT_PER_MINUTE
 dependencies:
-  - phoenixd # required; health check "primary"; main volume mounted read-only
+  - phoenixd # required; health check "primary"; public/full mounted read-only
   - fulcrum # only while onchain is on; health check "primary"
 interfaces:
   api: { type: api, port: 3338 }
@@ -255,5 +259,6 @@ tasks:
   - set-admin-password # important, while no password is stored
 health_checks:
   - primary # displayed "Cashu Mint"
+  - stats # publishes the dashboard summary
   - admin-ui # displayed "Admin Dashboard"
 ```

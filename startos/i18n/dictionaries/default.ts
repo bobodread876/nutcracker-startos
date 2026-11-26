@@ -121,6 +121,9 @@ const dict = {
   'Set a password to sign in to the Admin Dashboard.': 102,
   'The admin dashboard is ready': 103,
   'The admin dashboard is not responding': 104,
+  'Dashboard statistics': 105,
+  'Dashboard statistics are current': 106,
+  'Waiting for current mint statistics': 107,
 } as const
 
 /**

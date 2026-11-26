@@ -1,0 +1,380 @@
+--- a/public/index.html
++++ b/public/index.html
+@@ -3,20 +3,20 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+-  <title>Cashu Nutshell Admin</title>
+-  <link rel="icon" type="image/png" href="nut-logo.png">
+-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++  <title>Nutcracker Dashboard</title>
++  <link rel="icon" type="image/svg+xml" href="shell-stamp.svg">
+   <link rel="stylesheet" href="styles.css">
++  <link rel="stylesheet" href="graphite.css">
+ </head>
+ <body>
+   <div id="login-screen" class="login-screen hidden">
+     <div class="login-bg-pattern"></div>
+     <div class="login-container">
+       <div class="login-logo">
+-        <img src="cashu-logo.png" alt="Cashu" class="login-logo-img">
++        <img src="shell-stamp.svg" alt="" class="login-logo-img">
+       </div>
+-      <h1>Cashu Admin</h1>
+-      <p class="login-subtitle">Mint Administration Panel</p>
++      <h1>Nutcracker</h1>
++      <p class="login-subtitle">Mint dashboard</p>
+       <form id="login-form">
+         <div class="login-field">
+           <label for="login-user">Username</label>
+@@ -30,83 +30,55 @@
+         <p id="login-error" class="error-message hidden"></p>
+       </form>
+       <div class="login-footer">
+-        <img src="nut-logo.png" alt="" class="login-footer-nut">
+         <span>Powered by Cashu Nutshell</span>
+       </div>
+     </div>
+   </div>
+ 
+   <div id="main-app" class="hidden">
+-    <nav class="sidebar">
+-      <div class="sidebar-header">
+-        <div class="logo">
+-          <img src="nut-logo.png" alt="Cashu" class="sidebar-logo-img" style="width:28px;height:28px">
+-        </div>
+-        <h2>Cashu Admin</h2>
+-      </div>
+-      <ul class="nav-menu">
+-        <li class="nav-item active" data-page="dashboard">
+-          <span class="nav-icon">
+-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+-          </span>
+-          <span class="nav-text">Dashboard</span>
+-        </li>
+-        <li class="nav-item" data-page="monitoring">
+-          <span class="nav-icon">
+-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+-          </span>
+-          <span class="nav-text">Monitoring</span>
+-        </li>
+-        <li class="nav-item" data-page="keysets">
+-          <span class="nav-icon">
+-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+-          </span>
+-          <span class="nav-text">Keysets</span>
+-        </li>
+-        <li class="nav-item" data-page="database">
+-          <span class="nav-icon">
+-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+-          </span>
+-          <span class="nav-text">Database</span>
+-        </li>
+-        <li class="nav-item" data-page="logs">
+-          <span class="nav-icon">
+-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+-          </span>
+-          <span class="nav-text">Logs</span>
+-        </li>
+-      </ul>
+-      <div class="sidebar-footer">
+-        <div class="connection-status" id="connection-status">
+-          <span class="status-dot offline"></span>
+-          <span class="status-text">Disconnected</span>
+-        </div>
+-        <button id="logout-btn" class="btn btn-small btn-outline">Logout</button>
+-      </div>
++    <header class="app-header">
++      <span class="brand-lock"><img src="shell-stamp.svg" alt="" width="28" height="28">Nutcracker</span>
++      <span class="mint-chip">Mint <span id="mint-status">checking…</span></span>
++      <details class="account"><summary aria-label="Dashboard menu">•••</summary>
++        <div class="menu-sheet"><button type="button" class="nav-item" data-page="monitoring"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h5l2.5-7 4.2 14 2.8-8 1.8 1H22"/></svg><span>Monitoring</span></button><button type="button" class="nav-item" data-page="keysets"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8 2 2-2 2-1-1-2 2 1 1-2 2-1-1"/></svg><span>Keysets</span></button>
++          <button type="button" id="logout-btn">Sign out</button>
++        </div>
++      </details>
++    </header>
++    <nav class="tabbar" aria-label="Dashboard pages">
++      <button type="button" aria-current="page" class="nav-item active" data-page="dashboard"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg><span>Overview</span></button><button type="button" class="nav-item" data-page="database"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="3.5"/><path d="M4 5.5v12c0 2 3.6 3.5 8 3.5s8-1.5 8-3.5v-12M4 11.5c0 2 3.6 3.5 8 3.5s8-1.5 8-3.5"/></svg><span>Database</span></button><button type="button" class="nav-item" data-page="health"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h5l2.5-7 4.2 14 2.8-8 1.8 1H22"/></svg><span>Health</span></button><button type="button" class="nav-item" data-page="logs"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3.5" width="16" height="17" rx="3"/><path d="M8 8h8M8 12h8M8 16h5"/></svg><span>Logs</span></button>
+     </nav>
+-
+     <main class="main-content">
+-      <!-- Dashboard Page -->
+-      <section id="page-dashboard" class="page active">
+-        <div class="page-header">
+-          <h1>Dashboard</h1>
+-          <p>Mint status · <strong id="mint-status">Checking…</strong></p>
+-        </div>
+-
+-        <!-- Mint Balances — outstanding eCash per unit, shown at top of dashboard -->
+-        <div class="mint-balances-section" id="mint-balances-section">
+-          <div class="section-label">Outstanding eCash</div>
+-          <p id="summary-status" role="status">Checking current figures…</p>
+-          <div class="mint-balance-cards" id="mint-balance-cards">
+-            <div class="mint-balance-card mint-balance-placeholder">
+-              <div class="mint-balance-icon">⏳</div>
+-              <div class="mint-balance-info">
+-                <div class="mint-balance-unit">Loading balances...</div>
+-              </div>
+-            </div>
+-          </div>
+-        </div>
+-
++      <section id="page-dashboard" class="page active" aria-labelledby="overview-title">
++        <h1 id="overview-title">Overview</h1>
++        <div class="balance-hero">
++          <img class="patina-nut" src="patina-nut.png" width="480" height="480" alt="">
++          <div class="balance-copy"><p class="eyebrow">Outstanding eCash</p>
++            <div id="mint-balance-cards" class="balance-values">—</div>
++            <p id="summary-status" class="updated">Checking statistics…</p>
++          </div>
++        </div>
++        <div class="totals"><div><span>Issued</span><strong id="issued-total">—</strong></div>
++          <div><span>Redeemed</span><strong id="redeemed-total">—</strong></div></div>
++        <div class="section-heading"><h2>Quote activity</h2><small>Last 24h</small></div>
++        <div class="reading-list"><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 6-12 12M6 8v10h10"/></svg><span>Mint quotes</span><strong id="mint-day">—</strong></div><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 17 18 5M8 5h10v10"/></svg><span>Melt quotes</span><strong id="melt-day">—</strong></div></div>
++        <div class="section-heading"><h2>Mint details</h2></div>
++        <div class="reading-list"><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8 2 2-2 2-1-1-2 2 1 1-2 2-1-1"/></svg><span>Active keysets</span><strong id="summary-keys">—</strong></div><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="M8 18a7 7 0 0 0 11-9"/></svg><span>Spent proofs</span><strong id="summary-proofs">—</strong></div></div>
++      </section>
++      <section id="page-health" class="page" aria-labelledby="health-title">
++        <h1 id="health-title">Health</h1>
++        <div class="pulse-card"><div><p class="eyebrow">Mint status</p><strong id="pulse-state">Checking…</strong></div>
++          <span class="pulse-orb"><svg class="icon" width="33" height="33" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h5l2.5-7 4.2 14 2.8-8 1.8 1H22"/></svg></span>
++        </div>
++        <div class="age-card"><p class="eyebrow">Statistics age</p>
++          <p class="age"><strong id="age-seconds">—</strong> <span>seconds</span></p>
++          <div class="ruler" aria-hidden="true"><div id="ruler-fill"></div></div>
++          <div class="ruler-labels"><span>0s</span><span>Refresh every 30s</span></div>
++        </div>
++        <div class="section-heading"><h2>Services</h2></div>
++        <div class="reading-list"><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h5l2.5-7 4.2 14 2.8-8 1.8 1H22"/></svg><span>Mint service</span><strong id="mint-service">—</strong></div><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="3.5"/><path d="M4 5.5v12c0 2 3.6 3.5 8 3.5s8-1.5 8-3.5v-12M4 11.5c0 2 3.6 3.5 8 3.5s8-1.5 8-3.5"/></svg><span>Statistics collector</span><strong id="collector-service">—</strong></div><div class="reading"><svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg><span>Dashboard</span><strong id="dashboard-service">—</strong></div></div>
++        <details class="diagnostics"><summary>Diagnostics</summary>
++          <div class="connection-status" id="connection-status"><span class="status-dot offline"></span><span class="status-text">Disconnected</span></div>
+         <div class="stats-grid">
+           <div class="stat-card">
+             <div class="stat-icon stat-icon-blue">
+@@ -319,6 +291,7 @@
+             </div>
+           </div>
+         </div>
++        </details>
+       </section>
+ 
+       <!-- Monitoring Page -->
+@@ -641,6 +614,7 @@
+   <!-- Toast Notifications -->
+   <div id="toast-container" class="toast-container"></div>
+ 
++  <script src="graphite.js"></script>
+   <script src="app.js"></script>
+ </body>
+ </html>
+--- a/public/app.js
++++ b/public/app.js
+@@ -52,6 +52,7 @@
+     document.getElementById('main-app').classList.remove('hidden');
+     this.loadDashboard();
+     this.refreshSummary();
++    this.ageTimer = setInterval(() => Graphite.tick(), 1000);
+     this.summaryPoll = setInterval(() => this.refreshSummary(), 10000);
+     this.pollMintHealth();
+     this._mintHealthInterval = setInterval(() => this.pollMintHealth(), 10000);
+@@ -94,7 +95,9 @@
+     if (token && revoke) fetch('/api/session', {
+       method: 'DELETE', headers: { Authorization: 'Bearer ' + token }, keepalive: true,
+     }).catch(() => {});
++    clearInterval(this.ageTimer);
+     clearInterval(this.summaryPoll);
++    Graphite.health(null);
+     clearInterval(this._mintHealthInterval);
+     clearTimeout(this.summaryExpiry);
+     clearTimeout(this.reconnectTimer);
+@@ -105,6 +108,7 @@
+       this.ws = null;
+     }
+     this.renderSummary({});
++    document.querySelector('.account').open = false;
+     this.showLogin();
+     if (!revoke) {
+       const error = document.getElementById('login-error');
+@@ -207,9 +211,7 @@
+     try {
+       const data = await this.fetchWithAuth('/api/admin/dashboard');
+       
+-      // Mint status
+-      // The independent health poll also updates this status during an outage.
+-      document.getElementById('mint-status').style.color = data.mintInfo ? '#3fb950' : '#f85149';
++      // Mint reachability is updated independently by pollMintHealth.
+       
+       // Active keysets
+       const keysetsCount = data.keysets?.keysets?.length || 0;
+@@ -392,7 +394,7 @@
+       if (this.token !== token) return;
+       clearTimeout(this.summaryExpiry);
+       if (remaining <= 0 || !summary.db.available) return this.renderSummary({});
+-      this.renderSummary(summary);
++      this.renderSummary(summary, remaining);
+       this.summaryExpiry = setTimeout(() => this.renderSummary({}), remaining);
+     } catch {
+       if (this.token === token) this.renderSummary({});
+@@ -401,12 +403,8 @@
+     }
+   }
+ 
+-  renderSummary({ db = { available: false }, balances } = {}) {
+-    const note = document.getElementById('summary-status');
+-    note.textContent = db.available
+-      ? 'Figures updated ' + new Date(db.timestamp * 1000).toLocaleTimeString()
+-      : 'Statistics delayed. Retrying automatically.';
+-    this.updateMintBalances(balances);
++  renderSummary({ db = { available: false }, balances }, remaining = 0) {
++    Graphite.summary(db, balances, remaining);
+     this.updateDashboardDbStats(db);
+     this.renderDbPage(db);
+   }
+@@ -485,103 +483,6 @@
+    * Called when user navigates to the Database page.
+    */
+   // ---------------------------------------------------------------------------
+-  // Mint Balances
+-  // ---------------------------------------------------------------------------
+-  // Renders outstanding eCash per unit at the top of the dashboard.
+-  // outstanding = issued (outputs) - redeemed (proofs), grouped by unit.
+-  // Unit amounts: sat/msat = integers; usd/eur = cents (divide by 100).
+-
+-  /**
+-   * Render the mint balance cards at the top of the dashboard.
+-   * Gracefully shows a "Set MINT_DB_PATH" prompt when DB is unavailable.
+-   *
+-   * @param {{ available: boolean, balances?: Object }} data - from /api/admin/balances
+-   */
+-  updateMintBalances(data) {
+-    const container = document.getElementById('mint-balance-cards');
+-    if (!container) return;
+-
+-    if (!data || !data.available || !data.balances) {
+-      container.innerHTML = `
+-        <div class="mint-balance-card mint-balance-unavailable">
+-          <div class="mint-balance-icon">🔒</div>
+-          <div class="mint-balance-info">
+-            <div class="mint-balance-unit">Balance Unavailable</div>
+-            <div class="mint-balance-amount">—</div>
+-            <div class="mint-balance-sub">Waiting for current figures</div>
+-          </div>
+-        </div>`;
+-      return;
+-    }
+-
+-    if (Object.keys(data.balances).length === 0) {
+-      container.innerHTML = `
+-        <div class="mint-balance-card">
+-          <div class="mint-balance-icon">🥜</div>
+-          <div class="mint-balance-info">
+-            <div class="mint-balance-unit">Outstanding eCash</div>
+-            <div class="mint-balance-amount">0</div>
+-            <div class="mint-balance-sub">The mint has not issued any eCash yet</div>
+-          </div>
+-        </div>`;
+-      return;
+-    }
+-
+-    // Unit display config — icon, label, amount formatter, subtitle formatter
+-    const unitMeta = {
+-      sat: {
+-        label: 'Bitcoin (SAT)', icon: '₿', color: 'unit-btc',
+-        format: (n) => n.toLocaleString() + ' sats',
+-        sub:    (n) => '≈ ' + (n / 1e8).toFixed(8) + ' BTC'
+-      },
+-      msat: {
+-        label: 'Bitcoin (MSAT)', icon: '₿', color: 'unit-btc',
+-        format: (n) => n.toLocaleString() + ' msats',
+-        sub:    (n) => '≈ ' + (n / 1e11).toFixed(8) + ' BTC'
+-      },
+-      usd: {
+-        label: 'US Dollar (USD)', icon: '$', color: 'unit-usd',
+-        format: (n) => '$' + (n / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+-        sub:    (n) => n.toLocaleString() + ' cents outstanding'
+-      },
+-      eur: {
+-        label: 'Euro (EUR)', icon: '€', color: 'unit-eur',
+-        format: (n) => '€' + (n / 100).toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+-        sub:    (n) => n.toLocaleString() + ' cents outstanding'
+-      }
+-    };
+-
+-    const cards = Object.values(data.balances).map(b => {
+-      const meta = unitMeta[b.unit] || {
+-        label: b.unit.toUpperCase(), icon: '●', color: '',
+-        format: (n) => n.toLocaleString() + ' ' + b.unit,
+-        sub:    ()  => ''
+-      };
+-      return `
+-        <div class="mint-balance-card ${meta.color}">
+-          <div class="mint-balance-icon">${meta.icon}</div>
+-          <div class="mint-balance-info">
+-            <div class="mint-balance-unit">${meta.label}</div>
+-            <div class="mint-balance-amount">${meta.format(b.outstanding)}</div>
+-            <div class="mint-balance-sub">${meta.sub(b.outstanding)}</div>
+-            <div class="mint-balance-detail">issued: ${b.issued.toLocaleString()} · redeemed: ${b.redeemed.toLocaleString()}</div>
+-          </div>
+-        </div>`;
+-    });
+-
+-    container.innerHTML = cards.join('') || `
+-      <div class="mint-balance-card mint-balance-unavailable">
+-        <div class="mint-balance-icon">○</div>
+-        <div class="mint-balance-info">
+-          <div class="mint-balance-unit">No keysets found</div>
+-          <div class="mint-balance-amount">--</div>
+-        </div>
+-      </div>`;
+-  }
+-
+-  /**
+-   * Render the full Database page with all tables and breakdowns.
+-   */
+   renderDbPage(db) {
+     // Quote state descriptions for human readability
+     const mintStateDesc = {
+@@ -709,7 +610,7 @@
+     try {
+       const health = await this.fetchWithAuth('/api/admin/mint/health');
+ 
+-      document.getElementById('mint-status').textContent = health.reachable ? 'Online' : 'Unreachable';
++      Graphite.health(health.reachable);
+       // Latency bar (scale: 0-2000ms, anything over 2s = 100%)
+       const latencyEl = document.getElementById('mint-latency');
+       if (latencyEl) latencyEl.textContent = `${health.latencyMs}ms`;
+@@ -763,7 +664,7 @@
+         }
+       }
+     } catch (e) {
+-      document.getElementById('mint-status').textContent = 'Unknown';
++      Graphite.health(null);
+       const healthEl = document.getElementById('mint-health');
+       if (healthEl) {
+         healthEl.textContent = '● Error';
+@@ -834,11 +735,22 @@
+       item.addEventListener('click', () => {
+         const page = item.dataset.page;
+         
+-        document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
++        document.querySelectorAll('.nav-item').forEach(button => {
++          button.classList.remove('active');
++          button.removeAttribute('aria-current');
++        });
++        document.querySelector('.account').open = false;
++        item.setAttribute('aria-current', 'page');
++        window.scrollTo(0, 0);
+         item.classList.add('active');
+         
+         document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+-        document.getElementById(`page-${page}`).classList.add('active');
++        const section = document.getElementById(`page-${page}`);
++        section.classList.add('active');
++        document.body.dataset.page = page;
++        const heading = section.querySelector('h1');
++        heading.tabIndex = -1;
++        heading.focus({ preventScroll: true });
+         
+         // Load page data
+         if (page === 'monitoring') this.loadMonitoring();
