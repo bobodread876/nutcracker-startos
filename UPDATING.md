@@ -55,9 +55,10 @@ Run the full Nutshell test suite on the rebased branch before regenerating; the 
 npm ci
 npm test
 make x86
+npm run test:smoke
 ```
 
-The dashboard adapter in `dashboard/admin-ui.patch` applies to the pinned admin-ui submodule. Recheck balances, quote totals and authenticated metrics when changing that pin.
+The dashboard adapters in `dashboard/admin-ui.patch` and `dashboard/operator-ui.patch` apply in order to the pinned admin-ui submodule. The smoke test builds the package Dockerfile and upgrades a synthetic mint database. Recheck balances, quote totals and authenticated metrics when changing that pin.
 
 The image build itself fails if a patch rejects, and it imports the onchain and phoenixd modules as its last step. Then install on a StartOS server with phoenixd (and Fulcrum, for onchain) and drive it: the mint starts, Mint Status reports the seed present, a Lightning deposit and withdrawal settle, and with onchain on, a deposit mints after its confirmations and a withdrawal confirms. For a migration-bearing release, restore a disposable copy of a production-shaped backup and update it first.
 

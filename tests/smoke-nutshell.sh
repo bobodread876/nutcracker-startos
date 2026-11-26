@@ -6,11 +6,8 @@ set -euo pipefail
 # baseline when the packaged release changes:
 #   tests/smoke-nutshell.sh cashubtc/nutshell:0.20.3
 old_image="${1:-cashubtc/nutshell:0.19.2}"
-new_image="$(grep -o "cashubtc/nutshell:[^']*" startos/manifest/index.ts | head -1)"
-if [ -z "$new_image" ]; then
-  echo "Could not read the pinned image out of startos/manifest/index.ts" >&2
-  exit 1
-fi
+# Exercise the wrapper's Dockerfile, including the mint and dashboard patches.
+new_image="nutcracker-smoke-candidate:$$"
 smoke_dir="$(mktemp -d /tmp/nutshell-migration-smoke.XXXXXX)"
 old_container="scratch-nutshell-smoke-old-$$"
 new_container="scratch-nutshell-smoke-new-$$"
@@ -18,15 +15,17 @@ mint_key="1111111111111111111111111111111111111111111111111111111111111111"
 
 cleanup() {
   docker rm -f "$old_container" "$new_container" >/dev/null 2>&1 || true
+  docker image rm "$new_image" >/dev/null 2>&1 || true
   rm -rf -- "$smoke_dir"
 }
 trap cleanup EXIT
+docker build --platform linux/amd64 --tag "$new_image" .
 
 start_mint() {
   local image="$1"
   local container="$2"
 
-  docker run --detach \
+  docker run --platform linux/amd64 --detach \
     --name "$container" \
     --publish 127.0.0.1::3338 \
     --volume "$smoke_dir:/data" \
@@ -62,7 +61,7 @@ start_mint() {
 
 migration_version() {
   local image="$1"
-  docker run --rm \
+  docker run --platform linux/amd64 --rm \
     --volume "$smoke_dir:/data" \
     "$image" \
     python3 -c \
