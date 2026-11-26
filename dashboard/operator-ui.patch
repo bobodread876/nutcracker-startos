@@ -1,0 +1,556 @@
+--- a/server.js
++++ b/server.js
+@@ -272,8 +272,23 @@
+   return passwordMatches(credentials.pass) && userOk;
+ }
+ 
++const sessions = require('./sessions.cjs').createSessions();
++const bearer = req => (req.get('Authorization') || '').match(/^Bearer ([a-f0-9]{64})$/)?.[1];
++
++app.post('/api/session', (req, res) => {
++  res.set('Cache-Control', 'no-store');
++  if (!credentialsValid(auth(req))) return res.sendStatus(401);
++  res.json({ token: sessions.issue() });
++});
++
++app.delete('/api/session', (req, res) => {
++  sessions.revoke(bearer(req));
++  res.sendStatus(204);
++});
++
+ const requireAuth = (req, res, next) => {
+-  if (CONFIG.authType === 'none') return next();
++  res.set('Cache-Control', 'no-store');
++  if (CONFIG.authType === 'none' || sessions.valid(bearer(req))) return next();
+   if (!credentialsValid(auth(req))) {
+     return res.status(401).json({ error: 'Unauthorized' });
+   }
+@@ -697,6 +712,15 @@
+  *   - Request volume for the trailing 24h and 1h windows
+  *     (derived from created_time timestamps in mint_quotes + melt_quotes)
+  */
++app.get('/api/admin/summary', requireAuth, (req, res) => {
++  const summary = readSummary();
++  res.json({
++    db: getDbStats(summary),
++    balances: getMintBalances(summary),
++    validForMs: summary ? Math.max(0, summary.timestamp * 1000 + 65000 - Date.now()) : 0,
++  });
++});
++
+ app.get('/api/admin/db/stats', requireAuth, (req, res) => {
+   try {
+     const stats = getDbStats();
+@@ -719,7 +743,7 @@
+ 
+ wss.on('connection', (ws) => {
+   // Browsers cannot set headers on a WebSocket, so the client proves itself
+-  // with its first message: { type: 'auth', credentials: base64(user:pass) }.
++  // with its first message: { type: 'auth', token: sessionToken }.
+   ws.authenticated = CONFIG.authType === 'none';
+   let statsInterval = null;
+   const authTimeout = setTimeout(() => {
+@@ -737,12 +761,9 @@
+     if (ws.authenticated) return;
+     let msg = null;
+     try { msg = JSON.parse(raw.toString()); } catch { /* ignored */ }
+-    if (msg && msg.type === 'auth' && typeof msg.credentials === 'string') {
+-      const [name, ...rest] = Buffer.from(msg.credentials, 'base64').toString('utf8').split(':');
+-      if (credentialsValid({ name, pass: rest.join(':') })) {
+-        ws.authenticated = true;
+-        return start();
+-      }
++    if (msg?.type === 'auth' && sessions.attach(msg.token, ws)) {
++      ws.authenticated = true;
++      return start();
+     }
+     ws.close(4401, 'Unauthorized');
+   });
+--- a/public/app.js
++++ b/public/app.js
+@@ -6,12 +6,12 @@
+  *
+  * Architecture:
+  *   - CashuAdmin class manages all state and API communication
+- *   - HTTP Basic Auth credentials stored in localStorage (base64)
++ *   - Expiring dashboard sessions scoped to the browser tab
+  *   - WebSocket connection for real-time stats and log streaming
+  *   - Pages are show/hide sections (no client-side routing)
+  *
+  * API communication goes through fetchWithAuth() which injects the
+- * Basic Auth header on every request. On 401 responses, the user is
++ * session header on every request. On 401 responses, the user is
+  * automatically logged out and returned to the login screen.
+  *
+  * The dashboard is read-only: it shows the mint's state and changes nothing.
+@@ -21,7 +21,7 @@
+   constructor() {
+     this.apiBase = '/api';
+     this.authType = null;
+-    this.credentials = null;
++    this.token = sessionStorage.getItem('nutcracker-session');
+     this.ws = null;
+     this.reconnectAttempts = 0;
+     this.maxReconnectAttempts = 5;
+@@ -36,26 +36,12 @@
+   
+   // Authentication
+   checkAuth() {
+-    const savedCreds = localStorage.getItem('cashu_admin_creds');
+-    if (savedCreds) {
+-      try {
+-        const [user, pass] = atob(savedCreds).split(':');
+-        this.credentials = { name: user, pass: pass };
+-        this.fetchWithAuth('/api/admin/dashboard')
+-          .then(() => {
+-            this.showMainApp();
+-          })
+-          .catch(() => {
+-            this.showLogin();
+-          });
+-      } catch {
+-        this.showLogin();
+-      }
+-    } else {
+-      this.showLogin();
+-    }
+-  }
+-  
++    // Remove credentials saved by earlier dashboard versions.
++    localStorage.removeItem('cashu_admin_creds');
++    if (this.token) this.showMainApp();
++    else this.showLogin();
++  }
++
+   showLogin() {
+     document.getElementById('login-screen').classList.remove('hidden');
+     document.getElementById('main-app').classList.add('hidden');
+@@ -65,56 +51,79 @@
+     document.getElementById('login-screen').classList.add('hidden');
+     document.getElementById('main-app').classList.remove('hidden');
+     this.loadDashboard();
++    this.refreshSummary();
++    this.summaryPoll = setInterval(() => this.refreshSummary(), 10000);
++    this.pollMintHealth();
++    this._mintHealthInterval = setInterval(() => this.pollMintHealth(), 10000);
+     this.connectWebSocket();
+     this.initLogs();
+   }
+   
+-  doLogin(user, pass) {
+-    this.credentials = { name: user, pass: pass };
+-    localStorage.setItem('cashu_admin_creds', btoa(`${user}:${pass}`));
+-    
+-    this.fetchWithAuth('/api/admin/dashboard')
+-      .then(() => {
+-        this.showMainApp();
+-        this.showToast('Login successful!', 'success');
+-      })
+-      .catch((err) => {
+-        localStorage.removeItem('cashu_admin_creds');
+-        this.credentials = null;
+-        const errorEl = document.getElementById('login-error');
+-        errorEl.textContent = 'Invalid credentials';
+-        errorEl.classList.remove('hidden');
++  async doLogin(user, pass) {
++    const button = document.querySelector('#login-form button');
++    const error = document.getElementById('login-error');
++    error.classList.add('hidden');
++    button.disabled = true;
++    try {
++      const response = await fetch('/api/session', {
++        method: 'POST', headers: { Authorization: 'Basic ' + btoa(user + ':' + pass) },
++        cache: 'no-store', signal: AbortSignal.timeout(10000),
+       });
+-  }
+-  
+-  logout() {
+-    localStorage.removeItem('cashu_admin_creds');
+-    this.credentials = null;
++      if (!response.ok) {
++        throw new Error(response.status === 401 ? 'Check your dashboard password.' :
++          'Dashboard is unavailable. Try signing in again.');
++      }
++      const { token } = await response.json();
++      this.token = token;
++      sessionStorage.setItem('nutcracker-session', token);
++      document.getElementById('login-pass').value = '';
++      this.showMainApp();
++    } catch (err) {
++      error.textContent = err.message === 'Check your dashboard password.' ? err.message :
++        'Dashboard is unavailable. Try signing in again.';
++      error.classList.remove('hidden');
++    } finally {
++      button.disabled = false;
++    }
++  }
++
++  logout(revoke = true) {
++    const token = this.token;
++    this.token = null;
++    sessionStorage.removeItem('nutcracker-session');
++    if (token && revoke) fetch('/api/session', {
++      method: 'DELETE', headers: { Authorization: 'Bearer ' + token }, keepalive: true,
++    }).catch(() => {});
++    clearInterval(this.summaryPoll);
++    clearInterval(this._mintHealthInterval);
++    clearTimeout(this.summaryExpiry);
++    clearTimeout(this.reconnectTimer);
++    this.summaryRequest = null;
+     if (this.ws) {
++      this.ws.onclose = null;
+       this.ws.close();
+-    }
++      this.ws = null;
++    }
++    this.renderSummary({});
+     this.showLogin();
+-    this.showToast('Logged out', 'success');
+-  }
+-  
+-  // API Helper
++    if (!revoke) {
++      const error = document.getElementById('login-error');
++      error.textContent = 'Your session ended. Sign in again.';
++      error.classList.remove('hidden');
++    }
++  }
++
+   async fetchWithAuth(url, options = {}) {
+-    const headers = {
+-      ...options.headers,
+-      'Content-Type': 'application/json'
+-    };
+-    
+-    if (this.credentials) {
+-      headers['Authorization'] = 'Basic ' + btoa(`${this.credentials.name}:${this.credentials.pass}`);
+-    }
+-    
+-    const response = await fetch(url, { ...options, headers });
+-    
++    const token = this.token;
++    const response = await fetch(url, {
++      ...options, cache: 'no-store', signal: AbortSignal.timeout(10000),
++      headers: { ...options.headers, 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
++    });
++    if (!token || token !== this.token) throw new Error('Session ended');
+     if (response.status === 401) {
+-      this.logout();
+-      throw new Error('Unauthorized');
+-    }
+-    
++      this.logout(false);
++      throw new Error('Session ended');
++    }
+     if (!response.ok) {
+       const error = await response.json().catch(() => ({ error: 'Request failed' }));
+       throw new Error(error.error || error.details || 'Request failed');
+@@ -134,16 +143,11 @@
+     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+     const wsUrl = `${protocol}//${window.location.host}`;
+     
++    if (!this.token) return;
+     this.ws = new WebSocket(wsUrl);
+     
+     this.ws.onopen = () => {
+-      // The server expects credentials as the first message.
+-      if (this.credentials) {
+-        this.ws.send(JSON.stringify({
+-          type: 'auth',
+-          credentials: btoa(`${this.credentials.name}:${this.credentials.pass}`),
+-        }));
+-      }
++      this.ws.send(JSON.stringify({ type: 'auth', token: this.token }));
+       this.reconnectAttempts = 0;
+       this.updateConnectionStatus(true);
+       console.log('WebSocket connected');
+@@ -160,7 +164,7 @@
+     
+     this.ws.onclose = (event) => {
+       this.updateConnectionStatus(false);
+-      if (event.code === 4401) return this.logout();
++      if (event.code === 4401) return this.logout(false);
+       this.scheduleReconnect();
+     };
+     
+@@ -173,7 +177,7 @@
+     if (this.reconnectAttempts < this.maxReconnectAttempts) {
+       this.reconnectAttempts++;
+       const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+-      setTimeout(() => this.connectWebSocket(), delay);
++      this.reconnectTimer = setTimeout(() => this.connectWebSocket(), delay);
+     }
+   }
+   
+@@ -204,7 +208,7 @@
+       const data = await this.fetchWithAuth('/api/admin/dashboard');
+       
+       // Mint status
+-      document.getElementById('mint-status').textContent = data.mintInfo ? 'Online' : 'Offline';
++      // The independent health poll also updates this status during an outage.
+       document.getElementById('mint-status').style.color = data.mintInfo ? '#3fb950' : '#f85149';
+       
+       // Active keysets
+@@ -229,26 +233,6 @@
+         this.updateOsStats(data.os);
+       }
+ 
+-      // Load database entry counts (bounty req: "number of entries in database")
+-      if (data.db) {
+-        this.updateDashboardDbStats(data.db);
+-      }
+-
+-      // Mint balances — outstanding eCash per unit at top of dashboard
+-      if (data.balances) {
+-        this.updateMintBalances(data.balances);
+-      } else {
+-        // Fallback: fetch separately if not included in dashboard response
+-        this.fetchWithAuth('/api/admin/balances')
+-          .then(b => this.updateMintBalances(b))
+-          .catch(() => this.updateMintBalances(null));
+-      }
+-
+-      // Start mint health polling (every 10 seconds)
+-      this.pollMintHealth();
+-      if (this._mintHealthInterval) clearInterval(this._mintHealthInterval);
+-      this._mintHealthInterval = setInterval(() => this.pollMintHealth(), 10000);
+-      
+       // Load keysets
+       await this.loadKeysets();
+       
+@@ -397,6 +381,36 @@
+    * Update the compact DB stats panel on the dashboard overview cards.
+    * Called with data from the /api/admin/dashboard response (which includes db).
+    */
++  async refreshSummary() {
++    const token = this.token;
++    if (!token || this.summaryRequest) return;
++    this.summaryRequest = token;
++    const started = performance.now();
++    try {
++      const summary = await this.fetchWithAuth('/api/admin/summary');
++      const remaining = summary.validForMs - (performance.now() - started);
++      if (this.token !== token) return;
++      clearTimeout(this.summaryExpiry);
++      if (remaining <= 0 || !summary.db.available) return this.renderSummary({});
++      this.renderSummary(summary);
++      this.summaryExpiry = setTimeout(() => this.renderSummary({}), remaining);
++    } catch {
++      if (this.token === token) this.renderSummary({});
++    } finally {
++      if (this.summaryRequest === token) this.summaryRequest = null;
++    }
++  }
++
++  renderSummary({ db = { available: false }, balances } = {}) {
++    const note = document.getElementById('summary-status');
++    note.textContent = db.available
++      ? 'Figures updated ' + new Date(db.timestamp * 1000).toLocaleTimeString()
++      : 'Statistics delayed. Retrying automatically.';
++    this.updateMintBalances(balances);
++    this.updateDashboardDbStats(db);
++    this.renderDbPage(db);
++  }
++
+   updateDashboardDbStats(db) {
+     // Stat cards
+     const proofsEl = document.getElementById('db-proofs-count');
+@@ -407,19 +421,10 @@
+     if (req24hEl) req24hEl.textContent = db.available
+       ? (db.requestsLast24h ?? 0).toLocaleString() : 'N/A';
+ 
+-    if (!db.available) {
+-      // Hide the stats grid and request rows — show clean empty state instead
+-      const grid = document.querySelector('.db-stats-grid');
+-      if (grid) grid.style.display = 'none';
+-      const reqRow = document.getElementById('db-req-row');
+-      if (reqRow) reqRow.style.display = 'none';
+-      const msg = document.getElementById('db-unavailable-msg');
+-      if (msg) {
+-        msg.textContent = db.reason || 'The dashboard could not read the mint database.';
+-        msg.classList.remove('hidden');
+-      }
+-      return;
+-    }
++    document.querySelector('.db-stats-grid').style.display = db.available ? '' : 'none';
++    document.getElementById('db-req-row').style.display = db.available ? '' : 'none';
++    document.getElementById('db-unavailable-msg').classList.toggle('hidden', db.available);
++    if (!db.available) return;
+ 
+     const t = db.tables;
+ 
+@@ -441,7 +446,11 @@
+     const renderStateBreakdown = (barId, badgesId, byState, total) => {
+       const barEl = document.getElementById(barId);
+       const badgesEl = document.getElementById(badgesId);
+-      if (!byState || !total) return;
++      if (!byState || !total) {
++        if (barEl) barEl.replaceChildren();
++        if (badgesEl) badgesEl.replaceChildren();
++        return;
++      }
+ 
+       // Segmented bar — proportional widths
+       if (barEl) {
+@@ -475,15 +484,6 @@
+    * Load and render the full Database page with detailed breakdown tables.
+    * Called when user navigates to the Database page.
+    */
+-  async loadDbStats() {
+-    try {
+-      const db = await this.fetchWithAuth('/api/admin/db/stats');
+-      this.renderDbPage(db);
+-    } catch (error) {
+-      this.showToast('Failed to load database stats: ' + error.message, 'error');
+-    }
+-  }
+-
+   // ---------------------------------------------------------------------------
+   // Mint Balances
+   // ---------------------------------------------------------------------------
+@@ -507,8 +507,8 @@
+           <div class="mint-balance-icon">🔒</div>
+           <div class="mint-balance-info">
+             <div class="mint-balance-unit">Balance Unavailable</div>
+-            <div class="mint-balance-amount">Database not readable</div>
+-            <div class="mint-balance-sub">${this.escapeHtml(data?.reason || 'The dashboard could not read the mint database.')}</div>
++            <div class="mint-balance-amount">—</div>
++            <div class="mint-balance-sub">Waiting for current figures</div>
+           </div>
+         </div>`;
+       return;
+@@ -709,6 +709,7 @@
+     try {
+       const health = await this.fetchWithAuth('/api/admin/mint/health');
+ 
++      document.getElementById('mint-status').textContent = health.reachable ? 'Online' : 'Unreachable';
+       // Latency bar (scale: 0-2000ms, anything over 2s = 100%)
+       const latencyEl = document.getElementById('mint-latency');
+       if (latencyEl) latencyEl.textContent = `${health.latencyMs}ms`;
+@@ -762,6 +763,7 @@
+         }
+       }
+     } catch (e) {
++      document.getElementById('mint-status').textContent = 'Unknown';
+       const healthEl = document.getElementById('mint-health');
+       if (healthEl) {
+         healthEl.textContent = '● Error';
+@@ -840,11 +842,14 @@
+         
+         // Load page data
+         if (page === 'monitoring') this.loadMonitoring();
+-        if (page === 'database') this.loadDbStats();
++        if (page === 'database') this.refreshSummary();
+       });
+     });
+     
+     // Login form
++    document.addEventListener('visibilitychange', () => {
++      if (!document.hidden && this.token) this.refreshSummary();
++    });
+     document.getElementById('login-form').addEventListener('submit', (e) => {
+       e.preventDefault();
+       const user = document.getElementById('login-user').value;
+@@ -856,8 +861,8 @@
+     document.getElementById('logout-btn').addEventListener('click', () => this.logout());
+     
+     // Database refresh buttons
+-    document.getElementById('refresh-db-stats')?.addEventListener('click', () => this.loadDashboard());
+-    document.getElementById('refresh-db-page')?.addEventListener('click', () => this.loadDbStats());
++    document.getElementById('refresh-db-stats')?.addEventListener('click', () => this.refreshSummary());
++    document.getElementById('refresh-db-page')?.addEventListener('click', () => this.refreshSummary());
+ 
+     // Monitoring buttons
+     document.getElementById('clear-monitoring').addEventListener('click', () => this.clearMonitoring());
+--- a/public/index.html
++++ b/public/index.html
+@@ -5,9 +5,7 @@
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>Cashu Nutshell Admin</title>
+   <link rel="icon" type="image/png" href="nut-logo.png">
+-  <link rel="preconnect" href="https://fonts.googleapis.com">
+   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Karla:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+   <link rel="stylesheet" href="styles.css">
+ </head>
+ <body>
+@@ -22,11 +20,11 @@
+       <form id="login-form">
+         <div class="login-field">
+           <label for="login-user">Username</label>
+-          <input type="text" id="login-user" placeholder="Enter username" autocomplete="username">
++          <input type="text" id="login-user" value="admin" readonly autocomplete="username">
+         </div>
+         <div class="login-field">
+           <label for="login-pass">Password</label>
+-          <input type="password" id="login-pass" placeholder="Enter password" autocomplete="current-password">
++          <input type="password" id="login-pass" placeholder="Enter password" autofocus required autocomplete="current-password">
+         </div>
+         <button type="submit" class="btn btn-primary btn-full">Sign In</button>
+         <p id="login-error" class="error-message hidden"></p>
+@@ -92,12 +90,13 @@
+       <section id="page-dashboard" class="page active">
+         <div class="page-header">
+           <h1>Dashboard</h1>
+-          <p>Mint overview and quick stats</p>
++          <p>Mint status · <strong id="mint-status">Checking…</strong></p>
+         </div>
+ 
+         <!-- Mint Balances — outstanding eCash per unit, shown at top of dashboard -->
+         <div class="mint-balances-section" id="mint-balances-section">
+-          <div class="section-label">eCash in Circulation</div>
++          <div class="section-label">Outstanding eCash</div>
++          <p id="summary-status" role="status">Checking current figures…</p>
+           <div class="mint-balance-cards" id="mint-balance-cards">
+             <div class="mint-balance-card mint-balance-placeholder">
+               <div class="mint-balance-icon">⏳</div>
+@@ -109,16 +108,6 @@
+         </div>
+ 
+         <div class="stats-grid">
+-          <div class="stat-card">
+-            <div class="stat-icon stat-icon-purple">
+-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+-            </div>
+-            <div class="stat-info">
+-              <h3>Mint Status</h3>
+-              <p class="stat-value" id="mint-status">--</p>
+-              <span class="stat-label">Online</span>
+-            </div>
+-          </div>
+           <div class="stat-card">
+             <div class="stat-icon stat-icon-blue">
+               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+@@ -280,9 +269,7 @@
+                     <span class="db-activity-label">active keysets</span>
+                   </div>
+                 </div>
+-                <div id="db-unavailable-msg" class="hidden" style="text-align:center; opacity:0.5; font-size:0.85em; padding: 24px 0;">
+-                  The mint database could not be read.
+-                </div>
++                <div id="db-unavailable-msg" class="hidden" style="text-align:center; opacity:0.5; font-size:0.85em; padding: 24px 0;">Waiting for current figures.</div>
+               </div>
+             </div>
+           </div>
+--- a/public/styles.css
++++ b/public/styles.css
+@@ -1,5 +1,4 @@
+ /* Cashu Admin UI - Dark Theme */
+-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Karla:wght@400;500;600;700&display=swap');
+ 
+ :root {
+   --bg-primary: #0d1117;
+@@ -1652,3 +1651,13 @@
+   font-size: 1rem;
+   color: var(--text-muted);
+ }
++
++#summary-status { margin: .25rem 0 .75rem; }
++@media (max-width: 768px) {
++  .main-content { width: calc(100% - 70px); min-width: 0; }
++  .page, .card, .card-body, .stat-info, .mint-balance-info { min-width: 0; overflow-wrap: anywhere; }
++  .stats-grid, .stats-grid-2x2, .mint-balance-cards, .db-stats-grid, .dashboard-grid {
++    grid-template-columns: minmax(0, 1fr);
++  }
++  .card-body { overflow-x: auto; }
++}

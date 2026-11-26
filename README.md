@@ -6,7 +6,7 @@
 
 > Nutcracker is a fork of [Start9-Community/nutshell-startos](https://github.com/Start9-Community/nutshell-startos). Anything not listed in this document behaves as upstream Nutshell does, and the upstream documentation applies. See the Documentation section of `instructions.md` for links.
 
-[Nutshell](https://github.com/cashubtc/nutshell) is a Cashu mint: a server that issues and redeems Chaumian eCash backed by bitcoin. Nutcracker runs Nutshell 0.22.1 with patches upstream has not shipped: the payment-method abstraction, the NUT-30 onchain plugin, a phoenixd Lightning backend, and onchain payouts and deposits through phoenixd. Lightning settles through the operator's phoenixd node; onchain, when switched on, reads the chain from the operator's Fulcrum server. A read-only admin dashboard ([cashu-admin-ui](https://github.com/bobodread876/cashu-admin-ui)) runs beside the mint.
+[Nutshell](https://github.com/cashubtc/nutshell) is a Cashu mint: a server that issues and redeems Chaumian eCash backed by bitcoin. Nutcracker runs Nutshell with patches upstream has not shipped: the payment-method abstraction, the NUT-30 onchain plugin, a phoenixd Lightning backend, and onchain payouts and deposits through phoenixd. Lightning settles through the operator's phoenixd node; onchain, when switched on, reads the chain from the operator's Fulcrum server. A read-only admin dashboard ([cashu-admin-ui](https://github.com/bobodread876/cashu-admin-ui)) runs beside the mint.
 
 - **Upstream repo:** <https://github.com/cashubtc/nutshell>
 - **Wrapper repo:** <https://github.com/bobodread876/nutcracker-startos>
@@ -38,10 +38,10 @@ The official Nutshell image with Nutcracker's patches applied, built by `./Docke
 
 | Property     | Value                                                                 |
 | ------------ | --------------------------------------------------------------------- |
-| Base image   | `cashubtc/nutshell:0.22.1`, digest-pinned                             |
-| Source       | `upstream-project/` submodule at tag `0.22.1`, then `patches/*.patch` |
-| Extra        | `bdkpython==0.32.1`, hash-pinned in `bdk-requirements.txt`            |
-| Dashboard    | `admin-ui/` submodule, with Node 22 from a digest-pinned `node:22-bookworm-slim` build stage |
+| Base image   | `cashubtc/nutshell`, digest-pinned                             |
+| Source       | `upstream-project/` submodule at the corresponding upstream tag, then `patches/*.patch` |
+| Extra        | `bdkpython`, hash-pinned in `bdk-requirements.txt`            |
+| Dashboard    | `admin-ui/` submodule, with Node from the digest-pinned build stage in the Dockerfile |
 | Architecture | x86_64                                                                |
 | Command      | `poetry run mint`                                                     |
 
@@ -107,8 +107,8 @@ It is seeded on every init kind by an empty `merge`. Its four groups (`mint_info
 
 | Dependency | Required | Health checks | Why |
 | ---------- | -------- | ------------- | --- |
-| phoenixd (`phoenixd`) | Yes, `>=0.9.2:2` | `primary` | Creates and settles the Lightning invoices behind every Lightning deposit and withdrawal, and pays onchain withdrawals as splice-outs |
-| Fulcrum (`fulcrum`) | Only while onchain is switched on, `>=2.1.4:0` | `primary` | The Electrum server the deposit wallet and payout checks read the chain from |
+| phoenixd (`phoenixd`) | Yes | `primary` | Creates and settles the Lightning invoices behind every Lightning deposit and withdrawal, and pays onchain withdrawals as splice-outs |
+| Fulcrum (`fulcrum`) | Only while onchain is switched on | `primary` | The Electrum server the deposit wallet and payout checks read the chain from |
 
 **phoenixd** is reached over the service bridge at port 9740. Its full-access `http-password` is not published to dependents, so phoenixd's `main` volume is mounted read-only at `/mnt/phoenixd` and the password is read from `phoenix.conf` on each start. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
 
@@ -123,7 +123,7 @@ The host ids and ports are inlined in `startos/utils.ts`. Importing them from `p
 | Cashu Mint API | `api` | api | 3338 | The Cashu API wallets connect to |
 | Admin Dashboard | `admin` | ui | 3339 | The read-only dashboard; signs in with the Set Admin Password login |
 
-StartOS terminates TLS for both interfaces. The dashboard uses the public Cashu API for public mint information. A separate collector opens the mint ledger in SQLite read-only mode and publishes a JSON summary to the dedicated `stats` volume every 30 seconds. It includes quote counts and time windows, spent proof and signed output counts, keyset counts, and total issued and redeemed amounts per unit. The dashboard runs as the unprivileged `nobody` user and mounts only this volume, read-only. It reports unavailable statistics if two refreshes are missed.
+StartOS terminates TLS for both interfaces. The dashboard uses the public Cashu API for public mint information. A separate collector opens the mint ledger in SQLite read-only mode and publishes a JSON summary to the dedicated `stats` volume every 30 seconds. It includes quote counts and time windows, spent proof and signed output counts, keyset counts, and total issued and redeemed amounts per unit. The dashboard runs as the unprivileged `nobody` user and mounts only this volume, read-only. The open dashboard hides expired figures, retries automatically and shows the time of the most recent reading. The browser uses a tab-scoped, eight-hour session. Signing out or changing the dashboard password revokes access, including live updates. Authenticated monitoring clients can still use HTTP Basic authentication.
 
 ## Installation and First-Run Flow
 
@@ -201,7 +201,7 @@ A stale backup cannot be fixed by restoring it: eCash issued after the backup is
 
 ```yaml
 package_id: nutcracker
-image: built from ./Dockerfile # cashubtc/nutshell:0.22.1 digest-pinned + patches/
+image: built from ./Dockerfile # cashubtc/nutshell digest-pinned + patches/
 architectures:
   - x86_64
 subcontainers:

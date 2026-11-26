@@ -5,7 +5,7 @@
     "test:smoke": "bash tests/smoke-nutshell.sh"
   },
   "dependencies": {
-    "@start9labs/start-sdk": "^3.1.1",
+    "@start9labs/start-sdk": "4.1.0",
     "phoenixd-startos": "github:Start9-Community/phoenixd-startos#next"
   },
   "overrides": {
