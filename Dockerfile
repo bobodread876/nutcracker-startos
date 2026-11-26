@@ -33,8 +33,10 @@ COPY --from=admin-ui /opt/admin-ui /opt/admin-ui
 COPY dashboard/export_stats.py /opt/nutcracker/export_stats.py
 COPY dashboard/summary.cjs /opt/admin-ui/summary.cjs
 COPY dashboard/sessions.cjs /opt/admin-ui/sessions.cjs
-COPY dashboard/admin-ui.patch dashboard/operator-ui.patch /tmp/
+COPY dashboard/public/ /opt/admin-ui/public/
+COPY dashboard/admin-ui.patch dashboard/operator-ui.patch dashboard/graphite-ui.patch /tmp/
 RUN patch --batch --fuzz=0 -d /opt/admin-ui -p1 < /tmp/admin-ui.patch \
     && patch --batch --fuzz=0 -d /opt/admin-ui -p1 < /tmp/operator-ui.patch \
-    && rm /tmp/admin-ui.patch /tmp/operator-ui.patch \
+    && patch --batch --fuzz=0 -d /opt/admin-ui -p1 < /tmp/graphite-ui.patch \
+    && rm /tmp/admin-ui.patch /tmp/operator-ui.patch /tmp/graphite-ui.patch \
     && node -e "require('/opt/admin-ui/node_modules/express')"
