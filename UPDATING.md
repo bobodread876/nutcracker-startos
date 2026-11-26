@@ -73,3 +73,5 @@ git fetch upstream && git merge upstream/master
 ```
 
 Use the fork parent (`gh api repos/bobodread876/nutcracker-startos --jq .parent.full_name`), never the manifest's `upstreamRepo`, which is Nutshell itself.
+
+For Atoll, build and test the package in the local signing workspace. After release approval, run the [Atoll publisher](https://github.com/islandbitcoin/atoll/blob/main/registry/README.md) with `RELEASE_OWNER=bobodread876` and `SKIP_BUILD=1` against the tested package directory. The publisher creates the revision tag, uploads those same archives and indexes them in Atoll. GitHub runs a read-only build check on the tag with a temporary CI key.
