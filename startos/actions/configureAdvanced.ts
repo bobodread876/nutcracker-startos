@@ -62,9 +62,9 @@ const inputSpec = InputSpec.of({
     placeholder: '0',
   }),
   max_balance: Value.number({
-    name: i18n('New Quote Balance Limit'),
+    name: i18n('New Lightning Invoice Balance Limit'),
     description: i18n(
-      'Balance limit when accepting new mint quotes, not a ceiling on issuance from existing quotes or onchain deposits. 0 is unlimited.',
+      'Balance limit when accepting new Lightning invoices. Existing invoices and onchain deposits can take the balance above it. 0 is unlimited.',
     ),
     warning: null,
     default: 0,

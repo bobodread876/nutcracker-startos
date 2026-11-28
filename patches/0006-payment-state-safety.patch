@@ -84,7 +84,7 @@ index c1f5222..c7d1264 100644
          }
          return mint_features
 diff --git a/cashu/mint/ledger.py b/cashu/mint/ledger.py
-index c090267..a1f0af1 100644
+index c090267..64283eb 100644
 --- a/cashu/mint/ledger.py
 +++ b/cashu/mint/ledger.py
 @@ -649,7 +649,19 @@ class Ledger(
@@ -116,7 +116,36 @@ index c090267..a1f0af1 100644
          logger.trace("called request_mint")
          plugin = payment_method_registry.get(method_str)
          if not plugin.allows_partial_mint and not quote_request.amount > 0:
-@@ -833,11 +846,13 @@ class Ledger(
+@@ -692,11 +705,12 @@ class Ledger(
+         if quote_request.description and not plugin.supports_description(backend):
+             raise NotAllowedError("Backend does not support descriptions.")
+ 
+-        # Check maximum balance.
+-        # TODO: Allow setting MINT_MAX_BALANCE per unit
+-        if settings.mint_max_balance:
++        balance_limit = (
++            settings.mint_max_balance if method_name == Method.bolt11.name else None
++        )
++        if balance_limit:
+             balance, fees_paid = await self.get_unit_balance_and_fees(unit, db=self.db)
+-            if balance + quote_request.amount > settings.mint_max_balance:
++            if balance + quote_request.amount > balance_limit:
+                 raise NotAllowedError("Mint has reached maximum balance.")
+ 
+         logger.trace(f"requesting invoice for {unit.str(quote_request.amount)}")
+@@ -723,10 +737,7 @@ class Ledger(
+             raise TransactionAmountExceedsLimitError(
+                 f"Maximum mint amount is {settings.mint_max_mint_bolt11_sat} sat."
+             )
+-        if (
+-            settings.mint_max_balance
+-            and balance + quote_amount.amount > settings.mint_max_balance
+-        ):
++        if balance_limit and balance + quote_amount.amount > balance_limit:
+             raise NotAllowedError("Mint has reached maximum balance.")
+ 
+         if method_name == Method.bolt11.name:
+@@ -833,11 +844,13 @@ class Ledger(
                      if reported_paid > (quote.amount_paid or 0):
                          logger.trace(f"Setting quote {quote_id} as paid")
                          quote.amount_paid = reported_paid
@@ -135,7 +164,7 @@ index c090267..a1f0af1 100644
                          quote.paid_time = quote.paid_time or now
                          quote.last_checked = now
                          quote.updated_at = now
-@@ -892,6 +907,7 @@ class Ledger(
+@@ -892,6 +905,7 @@ class Ledger(
          Returns:
              List[BlindedSignature]: Signatures on the outputs.
          """
@@ -143,7 +172,7 @@ index c090267..a1f0af1 100644
          await self._verify_outputs(outputs)
          sum_amount_outputs = sum([b.amount for b in outputs])
          # we already know from _verify_outputs that all outputs have the same unit because they have the same keyset
-@@ -973,6 +989,7 @@ class Ledger(
+@@ -973,6 +987,7 @@ class Ledger(
          Returns:
              List[BlindedSignature]: Signatures on the outputs.
          """
@@ -151,7 +180,7 @@ index c090267..a1f0af1 100644
          if not payload.quotes:
              raise TransactionError("batch must not be empty")
  
-@@ -1225,15 +1242,10 @@ class Ledger(
+@@ -1225,15 +1240,10 @@ class Ledger(
  
          expiry = plugin.validate_payment_request(backend, request)
  
@@ -171,7 +200,7 @@ index c090267..a1f0af1 100644
              # check if the melt quote is partial and error if it is.
              # it's just not possible to handle this case
              if melt_quote.is_mpp:
-@@ -1389,23 +1401,15 @@ class Ledger(
+@@ -1389,23 +1399,15 @@ class Ledger(
                      expected_attempt=claimed.attempt,
                  )
  
@@ -198,7 +227,7 @@ index c090267..a1f0af1 100644
                          proofs = await self.crud.get_pending_proofs_for_quote(
                              quote_id=quote_id, db=self.db
                          )
-@@ -1445,18 +1449,12 @@ class Ledger(
+@@ -1445,18 +1447,12 @@ class Ledger(
          if not melt_quote_arg.pending:
              raise TransactionError("melt quote is not pending")
  

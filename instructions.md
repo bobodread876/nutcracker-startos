@@ -27,7 +27,7 @@ Nutcracker starts with working defaults. Do these in order:
 1. **Install and start phoenixd, and fund its channel.** Nutcracker will not start until it can reach phoenixd.
 2. **Start Nutcracker.** It creates its own mint seed on first install and comes up on the defaults, with Lightning only.
 3. **Run *Mint Info*.** Give the mint a name and a description. Wallets show this to people before they trust the mint with money. Add the contact and policy links you want published, and do this before you share the address.
-4. **Run *Advanced Settings* if you want limits on Lightning deposits and withdrawals.** These start unlimited. The balance setting only controls acceptance of new mint quotes; it does not cap issuance from existing quotes or onchain deposits.
+4. **Run *Advanced Settings* if you want limits on Lightning deposits and withdrawals.** These start unlimited. The balance setting only controls acceptance of new Lightning invoices; it does not cap issuance from existing quotes or onchain deposits.
 5. **Switch on onchain, if you want it.** Install Fulcrum and let it finish syncing, then run *Onchain Settings* and turn on *Onchain Deposits and Withdrawals*. Nutcracker creates the deposit wallet the next time it starts.
 6. **Run *Set Admin Password*** to open the admin dashboard. Save the password it shows; only a hash of it is kept.
 7. **Take a backup.** Verify a restore in isolation, without accepting payments or redemptions. Never serve the same mint from two instances.
@@ -67,7 +67,7 @@ Figures refresh about every 30 seconds. When they fall behind, the dashboard hid
 - **Mint Info**: the name, descriptions, message of the day, contact details and policy links wallets display for your mint.
 - **Lightning Fees**: how much of each outgoing Lightning payment is held back for routing. Both settings are a reserve, and what isn't needed comes back to the user as change. phoenixd does not accept a per-payment fee cap: if the actual routing fee exceeds the reserve, the mint pays the difference. A high reserve makes withdrawing look expensive.
 - **Onchain Settings**: onchain deposits and withdrawals on or off, the smallest onchain amount, confirmation counts, and the sweep rules.
-- **Advanced Settings**: log level, the fee you charge on inputs, Lightning deposit and withdrawal limits, a balance limit for new quotes, a withdrawals-only switch, and API rate limiting.
+- **Advanced Settings**: log level, the fee you charge on inputs, Lightning deposit and withdrawal limits, a balance limit for new Lightning invoices, a withdrawals-only switch, and API rate limiting.
 
   > **The balance limit is not a cap on funds or outstanding eCash.** Already accepted Lightning quotes and reusable onchain addresses can issue beyond it. Do not rely on it to bound your custody exposure.
 

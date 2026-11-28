@@ -150,7 +150,7 @@ The `onchain` group: on/off, the smallest onchain amount (the least minted from 
 
 ### Advanced Settings
 
-Log level, the NUT-02 input fee, Lightning mint and melt ceilings, a balance limit for new quotes, a redemptions-only switch, and API rate limiting. The mint and melt ceilings apply to Lightning only. The balance setting maps to `MINT_MAX_BALANCE`: new quote admission checks the outstanding balance plus that quote's fixed amount. It reserves no capacity; previously accepted Lightning quotes and reusable onchain quotes can issue beyond the threshold. It is not a total-custody or issuance cap. A limit of 0 disables its check: the variable is omitted. Redemptions Only blocks new quotes and all issuance, including single and batch issuance against existing onchain quotes; redemption remains available. Idempotent.
+Log level, the NUT-02 input fee, Lightning mint and melt ceilings, a balance limit for new Lightning invoices, a redemptions-only switch, and API rate limiting. The mint and melt ceilings apply to Lightning only. The balance setting maps to `MINT_MAX_BALANCE`: each new Lightning invoice checks the outstanding balance plus the invoice amount. Onchain deposit quotes skip this check. It reserves no capacity; previously accepted Lightning quotes and reusable onchain quotes can issue beyond the threshold. It is not a total-custody or issuance cap. A limit of 0 disables its check: the variable is omitted. Redemptions Only blocks new quotes and all issuance, including single and batch issuance against existing onchain quotes; redemption remains available. Idempotent.
 
 ### Set Admin Password
 
