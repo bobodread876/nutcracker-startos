@@ -84,7 +84,7 @@ export const buildMintEnvironment = (
     MINT_PRIVATE_KEY: seed.trim(),
     LOG_LEVEL: advanced?.log_level ?? 'INFO',
     MINT_INPUT_FEE_PPK: String(advanced?.input_fee_ppk ?? 0),
-    MINT_BOLT11_DISABLE_MINT: advanced?.peg_out_only ? 'true' : 'false',
+    MINT_DISABLE_MINT: advanced?.peg_out_only ? 'true' : 'false',
     MINT_RATE_LIMIT: (advanced?.rate_limit ?? true) ? 'true' : 'false',
     MINT_GLOBAL_RATE_LIMIT_PER_MINUTE: String(
       advanced?.rate_limit_per_minute ?? 60,

@@ -54,7 +54,7 @@ The build copies Nutshell's source from the submodule over the image's `/app/cas
 
 ### Patches
 
-`patches/` holds five patches, applied in order. Each one's header says when it retires.
+`patches/` holds six patches, applied in order. Each one's header says when it retires.
 
 | Patch | Adds | Retires when |
 | ----- | ---- | ------------ |
@@ -63,6 +63,7 @@ The build copies Nutshell's source from the submodule over the image's `/app/cas
 | `0003-onchain-phoenixd-payouts-and-deposits` | Onchain payouts as phoenixd splice-outs, an Electrum chain source, the deposit wallet and its sweep into phoenixd, and fixes for 0.22's melt flow (repeat payouts to one address, persisted fee choice, amountless deposit quotes) | Upstream ships phoenixd onchain support |
 | `0004-mask-secrets-in-startup-log` | Masks secrets in the startup log: nested payment-backend options, and any setting named like a credential (upstream's fixed list prints `mint_phoenixd_api_password` and `mint_lnd_rpc_macaroon` in the clear) | Upstream masks by name |
 | `0005-phoenixd-lightning-backend` | `PhoenixdWallet`, a bolt11 backend for phoenixd | Upstream ships a phoenixd backend |
+| `0006-payment-state-safety` | Payment-state safety, method-wide redemptions-only enforcement, separate deposit confirmation advertising, chain-only onchain settlement, and reusable-quote CLI amounts | Upstream includes these lifecycle, method-setting and CLI guarantees |
 
 `UPDATING.md` describes how the patches are regenerated and checked on a version bump.
 
@@ -141,15 +142,15 @@ The `mint_info` group: NUT-06 name, descriptions, message of the day, contacts a
 
 ### Lightning Fees
 
-The percentage and the minimum reserve (in sats) held back on each outgoing Lightning payment. Both are reserves; `PhoenixdWallet` charges the routing fee phoenixd reports and returns the rest as change. Idempotent.
+The percentage and the minimum reserve (in sats) held back on each outgoing Lightning payment. Both are reserves; `PhoenixdWallet` charges the routing fee phoenixd reports and returns the rest as change. phoenixd's API has no per-payment fee cap; any fee above the submitted reserve is borne by the mint. Idempotent.
 
 ### Onchain Settings
 
-The `onchain` group: on/off, the smallest onchain amount (the least minted from deposits at a time and the smallest withdrawal), deposit and withdrawal confirmations, the sweep threshold, the minimum daily sweep, and the daily sweep interval. The action carries a warning that deposits wait in a hot wallet. Switching it on makes Fulcrum a required dependency. Idempotent.
+The `onchain` group: on/off, the smallest onchain amount (the least minted from deposits at a time and the smallest withdrawal), deposit and withdrawal confirmations, the sweep threshold, the minimum daily sweep, and the daily sweep interval. The action carries a warning that deposits wait in a hot wallet. Switching it on makes Fulcrum a required dependency. Payments to this mint's own deposit addresses also settle onchain, not as internal transfers. A payout without a recorded send-response txid remains pending for manual reconciliation; the mint never guesses its identity from another payout. A confirmed payout also waits for its fee record before returning change. Idempotent.
 
 ### Advanced Settings
 
-Log level, the NUT-02 input fee, Lightning mint and melt ceilings, a total balance ceiling, a redemptions-only switch, and API rate limiting. A limit of 0 means unlimited: the variable is omitted. Idempotent.
+Log level, the NUT-02 input fee, Lightning mint and melt ceilings, a total balance ceiling, a redemptions-only switch, and API rate limiting. A limit of 0 means unlimited: the variable is omitted. Redemptions Only blocks new quotes and all issuance, including single and batch issuance against existing onchain quotes; redemption remains available. Idempotent.
 
 ### Set Admin Password
 
@@ -183,7 +184,7 @@ Backups cover the mint and its configuration: `sdk.Backups.ofVolumes('main', 'st
 
 A restored instance needs nothing re-entered. Init sees the existing seed and does not generate one, and the oneshot sees the existing deposit phrase. phoenixd's and Fulcrum's addresses are resolved fresh on every start.
 
-A stale backup cannot be fixed by restoring it: eCash issued after the backup is refused by the restored ledger. Back up after real activity.
+Restoring a stale ledger rolls back the spent-proof records: tokens redeemed after the backup can become spendable again. Tokens issued afterward are not necessarily rejected when their signing keyset is present. A backup restores a consistent snapshot, not activity since that snapshot; reopening a stale mint can lose reserves. Keep it offline until its later activity has been reconciled, and never run two instances of the same mint.
 
 ## Limitations and Differences
 
@@ -240,7 +241,7 @@ startos_managed_env_vars:
   - MINT_MAX_MINT_BOLT11_SAT # omitted when unlimited
   - MINT_MAX_MELT_BOLT11_SAT # omitted when unlimited
   - MINT_MAX_BALANCE # omitted when unlimited
-  - MINT_BOLT11_DISABLE_MINT
+  - MINT_DISABLE_MINT
   - MINT_RATE_LIMIT
   - MINT_GLOBAL_RATE_LIMIT_PER_MINUTE
 dependencies:
