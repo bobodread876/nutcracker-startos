@@ -24,7 +24,7 @@ Read every upstream release between the packaged and target versions. Check:
 
 ## Regenerating the patches
 
-The patches come from the `nutcracker/<version>` branch of a Nutshell checkout, rebased onto the new tag. Each patch is a `git diff` restricted to `cashu/`:
+Patches 0001 through 0005 come from the `nutcracker/<version>` branch of a Nutshell checkout, rebased onto the new tag. Rebase `0006-payment-state-safety.patch` over their resulting source; preserve its lifecycle, method-setting and reusable-quote CLI guarantees until upstream owns them. Each patch is a `git diff` restricted to `cashu/`:
 
 ```sh
 git -C <nutshell> diff <from> <to> -- cashu > patches/000N-<name>.patch   # keep the header block

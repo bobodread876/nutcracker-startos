@@ -125,7 +125,7 @@ test('maps operator settings to current Nutshell environment variables', () => {
   assert.equal(env.MINT_MAX_MINT_BOLT11_SAT, '1000')
   assert.equal(env.MINT_MAX_MELT_BOLT11_SAT, '900')
   assert.equal(env.MINT_MAX_BALANCE, '5000')
-  assert.equal(env.MINT_BOLT11_DISABLE_MINT, 'true')
+  assert.equal(env.MINT_DISABLE_MINT, 'true')
   assert.equal(env.MINT_RATE_LIMIT, 'true')
   assert.equal(env.MINT_GLOBAL_RATE_LIMIT_PER_MINUTE, '120')
 })
