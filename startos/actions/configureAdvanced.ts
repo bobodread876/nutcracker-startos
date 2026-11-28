@@ -34,9 +34,9 @@ const inputSpec = InputSpec.of({
     placeholder: '0',
   }),
   max_peg_in: Value.number({
-    name: i18n('Maximum Mint Amount'),
+    name: i18n('Maximum Lightning Mint Amount'),
     description: i18n(
-      'Largest amount that can be turned into eCash in one operation. 0 is unlimited.',
+      'Largest Lightning deposit allowed in a new mint quote. Does not limit onchain deposits. 0 is unlimited.',
     ),
     warning: null,
     default: 0,
@@ -48,7 +48,7 @@ const inputSpec = InputSpec.of({
     placeholder: '0',
   }),
   max_peg_out: Value.number({
-    name: i18n('Maximum Melt Amount'),
+    name: i18n('Maximum Lightning Melt Amount'),
     description: i18n(
       'Largest amount that can be redeemed to Lightning in one operation. 0 is unlimited.',
     ),
@@ -62,9 +62,9 @@ const inputSpec = InputSpec.of({
     placeholder: '0',
   }),
   max_balance: Value.number({
-    name: i18n('Maximum Balance'),
+    name: i18n('New Lightning Invoice Balance Limit'),
     description: i18n(
-      'Largest total balance the mint will hold. 0 is unlimited.',
+      'Balance limit when accepting new Lightning invoices. Existing invoices and onchain deposits can take the balance above it. 0 is unlimited.',
     ),
     warning: null,
     default: 0,
