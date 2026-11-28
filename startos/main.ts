@@ -99,12 +99,10 @@ export const main = sdk.setupMain(async ({ effects }) => {
   const subcontainer = sdk.SubContainer.of(
     effects,
     { imageId: 'main' },
-    // phoenixd publishes no credential to dependents; its full-access
-    // http-password lives in phoenix.conf on its main volume.
     dataVolume.mountDependency<typeof phoenixdManifest>({
       dependencyId: 'phoenixd',
-      volumeId: 'main',
-      subpath: null,
+      volumeId: 'public',
+      subpath: 'full',
       mountpoint: phoenixdMountpoint,
       readonly: true,
     }),
@@ -237,11 +235,12 @@ export const main = sdk.setupMain(async ({ effects }) => {
 })
 
 async function readPhoenixdHttpPassword(rootfs: string): Promise<string> {
-  const conf = await readFile(
-    `${rootfs}${phoenixdMountpoint}/phoenix.conf`,
+  const password = await readFile(
+    `${rootfs}${phoenixdMountpoint}/http-password`,
     'utf-8',
-  ).catch(() => '')
-  const password = conf.match(/^http-password=(.*)$/m)?.[1]?.trim()
+  )
+    .then((p) => p.trim())
+    .catch(() => '')
   if (!password) {
     throw new Error(
       i18n(

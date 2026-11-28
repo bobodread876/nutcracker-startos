@@ -1,23 +1,21 @@
 <p align="center">
-  <img src="icon.png" alt="Nutshell logo" width="21%" />
+  <img src="icon.png" alt="Nutcracker logo" width="21%" />
 </p>
 
 # Nutcracker on StartOS
 
-> Nutcracker is a fork of [Start9-Community/nutshell-startos](https://github.com/Start9-Community/nutshell-startos). Anything not listed in this document behaves as upstream Nutshell does, and the upstream documentation applies. See the Documentation section of `instructions.md` for links.
+> Anything not listed in this document behaves as upstream Nutshell does, and the upstream documentation applies. See the Documentation section of `instructions.md` for links.
 
 [Nutshell](https://github.com/cashubtc/nutshell) is a Cashu mint: a server that issues and redeems Chaumian eCash backed by bitcoin. Nutcracker runs Nutshell with patches upstream has not shipped: the payment-method abstraction, the NUT-30 onchain plugin, a phoenixd Lightning backend, and onchain payouts and deposits through phoenixd. Lightning settles through the operator's phoenixd node; onchain, when switched on, reads the chain from the operator's Fulcrum server. A read-only admin dashboard ([cashu-admin-ui](https://github.com/bobodread876/cashu-admin-ui)) runs beside the mint.
 
 - **Upstream repo:** <https://github.com/cashubtc/nutshell>
-- **Wrapper repo:** <https://github.com/bobodread876/nutcracker-startos>
-- **Fork parent:** <https://github.com/Start9-Community/nutshell-startos>
+- **Wrapper repo:** <https://github.com/Start9-Community/nutcracker-startos>
 
 ---
 
 ## Table of Contents
 
 - [Image and Container Runtime](#image-and-container-runtime)
-- [Patches](#patches)
 - [Volume and Data Layout](#volume-and-data-layout)
 - [File Models](#file-models)
 - [Dependencies](#dependencies)
@@ -54,7 +52,7 @@ The official Nutshell image with Nutcracker's patches applied, built by `./Docke
 
 The build copies Nutshell's source from the submodule over the image's `/app/cashu` (the two are identical at the pinned tag), applies the patches, and installs `bdkpython`. The image's own dependencies are left as upstream built them. Every setting this package controls is passed as environment on each start.
 
-## Patches
+### Patches
 
 `patches/` holds five patches, applied in order. Each one's header says when it retires.
 
@@ -70,7 +68,7 @@ The build copies Nutshell's source from the submodule over the image's `/app/cas
 
 ## Volume and Data Layout
 
-Two volumes.
+Three volumes.
 
 | Volume | Mount Point | Purpose |
 | ------ | ----------- | ------- |
@@ -99,9 +97,9 @@ Two models.
 | `startos/config.yaml` (on `main`) | YAML | `FileHelper.yaml` | Init and the actions |
 | `store.json` (on `startos`) | JSON | `FileHelper.json` | Set Admin Password |
 
-It is seeded on every init kind by an empty `merge`. Its four groups (`mint_info`, `fees`, `advanced`, `onchain`) map onto the configuration actions, and `startos/mintEnvironment.ts` turns them into Nutshell's environment on every start. The `onchain` group becomes a `MINT_PAYMENT_BACKENDS` entry when onchain is switched on.
+`config.yaml` is seeded on every init kind by an empty `merge`. Its four groups (`mint_info`, `fees`, `advanced`, `onchain`) map onto the configuration actions, and `startos/mintEnvironment.ts` turns them into Nutshell's environment on every start. The `onchain` group becomes a `MINT_PAYMENT_BACKENDS` entry when onchain is switched on.
 
-`fees.fee_reserve_min` is in sats. Nutshell reads `LIGHTNING_RESERVE_FEE_MIN` in msat, so the environment carries the setting times 1,000. (The fork parent passes the sats figure through unconverted, which makes the floor a thousandth of the labelled value.)
+`fees.fee_reserve_min` is in sats. Nutshell reads `LIGHTNING_RESERVE_FEE_MIN` in msat, so the environment carries the setting times 1,000.
 
 ## Dependencies
 
@@ -110,11 +108,11 @@ It is seeded on every init kind by an empty `merge`. Its four groups (`mint_info
 | phoenixd (`phoenixd`) | Yes | `primary` | Creates and settles the Lightning invoices behind every Lightning deposit and withdrawal, and pays onchain withdrawals as splice-outs |
 | Fulcrum (`fulcrum`) | Only while onchain is switched on | `primary` | The Electrum server the deposit wallet and payout checks read the chain from |
 
-**phoenixd** is reached over the service bridge at port 9740. Its full-access `http-password` is not published to dependents, so phoenixd's `main` volume is mounted read-only at `/mnt/phoenixd` and the password is read from `phoenix.conf` on each start. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
+**phoenixd** is reached over the service bridge at port 9740. phoenixd exports its full-access `http-password` for dependents at `full/http-password` on its `public` volume; that directory alone is mounted read-only at `/mnt/phoenixd`, and the password is read on each start. Rotating it with phoenixd's own action takes effect here on Nutcracker's next restart.
 
 **Fulcrum** is reached over the plaintext service bridge at port 50001 (`tcp://`). The dependency is optional and enabled from `onchain.enabled`, so a mint without onchain does not require Fulcrum.
 
-The host ids and ports are inlined in `startos/utils.ts`. Importing them from `phoenixd-startos` or `fulcrum-startos` pulls in `electrs-startos`, whose `#next` does not type-check against `bitcoin-core-startos#next`.
+The host ids and ports are inlined in `startos/utils.ts`, since a value import from `phoenixd-startos` or `fulcrum-startos` would bundle each one's dependency graph into this package.
 
 ## Network Access and Interfaces
 
@@ -127,7 +125,7 @@ StartOS terminates TLS for both interfaces. The dashboard uses the public Cashu 
 
 ## Installation and First-Run Flow
 
-Install phoenixd first and start it once, so it writes `phoenix.conf`. Then install Nutcracker.
+Install phoenixd first and start it once, so it exports its password. Then install Nutcracker.
 
 At install the package generates the mint seed and seeds `config.yaml` with defaults; onchain starts switched off. On every start it resolves phoenixd's bridge address, reads its password, builds the environment and launches the mint.
 
@@ -175,11 +173,13 @@ Read-only, any status. Reports whether the mint seed and the deposit phrase exis
 | `stats` | "Dashboard statistics" | The summary is current (once an admin password is set). |
 | `admin-ui` | "Admin Dashboard" | `GET /health` on 3339 answers (once a password is set) |
 
+`stats` fails when the summary is more than about a minute old: the collector has stopped or cannot read the ledger, and its log says which. `admin-ui` failing with `stats` green means the dashboard process itself is down.
+
 A start that fails before the daemon exists is `main.ts` throwing, and the log says why: phoenixd unreachable, phoenixd's password unreadable, or onchain switched on with Fulcrum unreachable. A listening port proves the mint is serving, not that it can settle; only a real deposit and withdrawal prove the payment paths.
 
 ## Backups and Restore
 
-Backups cover the mint and its configuration: `sdk.Backups.ofVolumes('main', 'startos')`. The mint seed, the ledger and the deposit phrase are captured together. phoenixd's own volume is mounted read-only and is never part of Nutcracker's backup; phoenixd backs itself up.
+Backups cover the mint and its configuration: `sdk.Backups.ofVolumes('main', 'startos')`. The mint seed, the ledger and the deposit phrase are captured together. phoenixd's password export is mounted read-only and is never part of Nutcracker's backup; phoenixd backs itself up.
 
 A restored instance needs nothing re-entered. Init sees the existing seed and does not generate one, and the oneshot sees the existing deposit phrase. phoenixd's and Fulcrum's addresses are resolved fresh on every start.
 
@@ -187,7 +187,7 @@ A stale backup cannot be fixed by restoring it: eCash issued after the backup is
 
 ## Limitations and Differences
 
-1. **phoenixd is the only Lightning backend.** The fork parent's Core Lightning backend is removed.
+1. **phoenixd is the only Lightning backend.** Core Lightning and LND are not offered.
 2. **SQLite only.**
 3. **x86_64 only.** `bdkpython` publishes no Linux arm64 wheel and no source distribution.
 4. **Onchain is mainnet only**, because phoenixd is.
@@ -211,6 +211,7 @@ subcontainers:
   - admin-ui-sub # dashboard, mounts only stats read-only
 volumes:
   main: /data
+  stats: /stats
   startos: unmounted # store.json
 file_models:
   - startos/config.yaml # mint_info, fees, advanced, onchain
@@ -243,7 +244,7 @@ startos_managed_env_vars:
   - MINT_RATE_LIMIT
   - MINT_GLOBAL_RATE_LIMIT_PER_MINUTE
 dependencies:
-  - phoenixd # required; health check "primary"; main volume mounted read-only
+  - phoenixd # required; health check "primary"; public/full mounted read-only
   - fulcrum # only while onchain is on; health check "primary"
 interfaces:
   api: { type: api, port: 3338 }

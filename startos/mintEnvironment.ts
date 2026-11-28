@@ -1,51 +1,4 @@
-/**
- * Pure mapping from the operator's settings to Nutshell's environment.
- *
- * Deliberately import-free so `tests/mint-environment.test.ts` runs under plain
- * `node --test` without the SDK: Node's resolver needs full specifiers, so any
- * relative import here would break the test rather than the build.
- *
- * That costs a hand-written config type, which `config.yaml.ts` would otherwise
- * own. The fields below are therefore **required**, not optional — that is what
- * makes a rename in the zod shape a compile error at the `main.ts` call site
- * instead of a silently-defaulted environment variable.
- */
-export type MintEnvironmentConfig = {
-  mint_info: {
-    name: string
-    description: string
-    description_long: string
-    motd: string
-    contact_email: string
-    contact_nostr: string
-    contact_twitter: string
-    icon_url: string
-    tos_url: string
-  }
-  fees: {
-    fee_percent: number
-    fee_reserve_min: number
-  }
-  advanced: {
-    log_level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR'
-    input_fee_ppk: number
-    max_peg_in: number
-    max_peg_out: number
-    max_balance: number
-    peg_out_only: boolean
-    rate_limit: boolean
-    rate_limit_per_minute: number
-  }
-  onchain: {
-    enabled: boolean
-    min_amount: number
-    payout_confirmations: number
-    deposit_confirmations: number
-    sweep_threshold: number
-    sweep_min: number
-    sweep_max_age_hours: number
-  }
-}
+import type { ConfigType } from './fileModels/config.yaml'
 
 /** phoenixd's HTTP API as reached over the StartOS bridge. */
 export type PhoenixdConnection = {
@@ -75,7 +28,7 @@ export const PHOENIXD_FAILED_SENDS_FILE = '/data/phoenixd-failed-sends.jsonl'
 
 /** The onchain backend config Nutshell reads from MINT_PAYMENT_BACKENDS. */
 export const buildOnchainBackend = (
-  onchain: MintEnvironmentConfig['onchain'],
+  onchain: ConfigType['onchain'],
   phoenixd: PhoenixdConnection,
   electrumUrl: string,
 ): Record<string, unknown> => ({
@@ -103,7 +56,7 @@ export const buildOnchainBackend = (
 })
 
 export const buildMintEnvironment = (
-  config: MintEnvironmentConfig | null,
+  config: ConfigType | null,
   seed: string,
   phoenixd: PhoenixdConnection,
   onchain: OnchainConnection,

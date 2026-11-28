@@ -4,15 +4,15 @@ export const current = VersionInfo.of({
   version: '0.22.1:5',
   releaseNotes: {
     en_US:
-      'Graphite & Ember adds a mobile overview and a Health tab for mint reachability and statistics freshness.',
+      'First release on the Community Registry: the Nutshell 0.22.1 Cashu mint with phoenixd for Lightning, optional NUT-30 onchain deposits and withdrawals, and a password-protected dashboard of aggregate mint statistics.',
     es_ES:
-      'Graphite & Ember incorpora un resumen móvil y una pestaña de salud para comprobar la conexión con la casa de moneda y la antigüedad de las estadísticas.',
+      'Primera versión en el Community Registry: la casa de moneda Cashu Nutshell 0.22.1 con phoenixd para Lightning, depósitos y retiros onchain NUT-30 opcionales y un panel protegido por contraseña con estadísticas agregadas de la casa de moneda.',
     de_DE:
-      'Graphite & Ember bietet eine mobile Übersicht und einen Statusbereich für die Erreichbarkeit der Mint und das Alter der Statistiken.',
+      'Erste Veröffentlichung in der Community Registry: die Cashu-Mint Nutshell 0.22.1 mit phoenixd für Lightning, optionalen NUT-30-Onchain-Einzahlungen und -Auszahlungen sowie einem passwortgeschützten Dashboard mit aggregierten Mint-Statistiken.',
     pl_PL:
-      'Graphite & Ember dodaje widok mobilny oraz kartę stanu z dostępnością mennicy i wiekiem statystyk.',
+      'Pierwsze wydanie w Community Registry: mennica Cashu Nutshell 0.22.1 z phoenixd dla Lightning, opcjonalnymi wpłatami i wypłatami onchain NUT-30 oraz chronionym hasłem panelem z zagregowanymi statystykami mennicy.',
     fr_FR:
-      'Graphite & Ember ajoute une vue mobile et un onglet de santé pour suivre la disponibilité de la monnaie et l’âge des statistiques.',
+      'Première version sur le Community Registry : la monnaie Cashu Nutshell 0.22.1 avec phoenixd pour Lightning, des dépôts et retraits onchain NUT-30 facultatifs, et un tableau de bord protégé par mot de passe présentant des statistiques agrégées de la monnaie.',
   },
   migrations: {
     up: async ({ effects }) => {},

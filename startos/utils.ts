@@ -17,11 +17,7 @@ export const depositMnemonicFile = DEPOSIT_MNEMONIC_FILE.replace(
   '',
 )
 
-/**
- * phoenixd's API host and port, from phoenixd-startos's startos/interfaces.ts
- * and startos/utils.ts. Inlined: those modules import electrs-startos, whose
- * bitcoin-core imports do not type-check against bitcoin-core's #next.
- */
+// From phoenixd-startos's interfaces.ts and utils.ts; a value import would bundle its whole dependency graph.
 export const phoenixdHostId = 'api-multi'
 export const phoenixdPort = 9740
 
@@ -30,13 +26,9 @@ export const adminUiPort = 3339
 export const adminUiDir = '/opt/admin-ui'
 export const adminUiUser = 'admin'
 
-/** Where phoenixd's main volume (and its phoenix.conf) is mounted, read-only. */
+/** Where phoenixd's `public/full` export (its http-password) is mounted, read-only. */
 export const phoenixdMountpoint = '/mnt/phoenixd'
 
-/**
- * Fulcrum's Electrum host and plaintext port, from fulcrum-startos's
- * startos/utils.ts. Inlined: importing that package drags in electrs-startos,
- * whose bitcoin-core imports do not type-check against bitcoin-core's #next.
- */
+// From fulcrum-startos's interfaces.ts and utils.ts, inlined for the same reason.
 export const fulcrumHostId = 'main'
 export const fulcrumElectrumPort = 50001

@@ -8,9 +8,9 @@
 
 ## Documentation
 
-- [Nutshell README](https://github.com/cashubtc/nutshell/blob/main/README.md): the upstream mint, including what each setting does.
-- [Cashu documentation](https://docs.cashu.space): how Cashu works, and the NUT specifications the settings refer to.
-- [NUT-30](https://github.com/cashubtc/nuts): onchain deposits and withdrawals.
+- [Nutshell README](https://github.com/cashubtc/nutshell/blob/main/README.md) — the upstream mint, including what each setting does
+- [Cashu documentation](https://docs.cashu.space) — how Cashu works
+- [Cashu NUTs](https://github.com/cashubtc/nuts) — the protocol specifications the settings refer to, NUT-30 onchain among them
 
 ## What you get on StartOS
 
@@ -54,7 +54,13 @@ The deposit wallet is a hot wallet on this server. Its recovery phrase is stored
 
 ### The admin dashboard
 
-Open the **Admin Dashboard** interface and enter the password from *Set Admin Password*. The username is filled in. Your session lasts up to eight hours in this tab. You can sign out at any time. Overview shows the outstanding eCash and the mint and melt quotes from the last 24 hours. Open Health to see whether the mint is reachable and how long ago the collector refreshed its figures. Open the dashboard menu for Monitoring, Keysets or Sign out. If they are delayed, it hides them and retries automatically. A displayed zero is a current reading. It shows outstanding eCash per unit, quote counts, keysets, the mint's health and the server's load. It only reads: mint settings are changed through the actions below.
+Open the **Admin Dashboard** interface and sign in with the password from *Set Admin Password*; the username is filled in. A session lasts up to eight hours in that browser tab, and you can sign out at any time.
+
+- **Overview** shows the outstanding eCash per unit and the mint and melt quotes from the last 24 hours.
+- **Health** shows whether the mint is reachable and how long ago the figures were refreshed.
+- The dashboard menu opens **Monitoring** (the server's load), **Keysets**, and **Sign out**.
+
+Figures refresh about every 30 seconds. When they fall behind, the dashboard hides them until fresh ones arrive, so a zero on screen is a current reading. The dashboard only reads: mint settings are changed through the actions below.
 
 ### Actions
 
@@ -77,7 +83,4 @@ A restore cannot recover eCash issued after the backup was taken. Those tokens e
 
 ## Limitations
 
-- **phoenixd is the only Lightning backend**, and SQLite the only database.
-- **Onchain needs Fulcrum.** It runs on mainnet, where phoenixd runs.
-- **x86_64 servers only for now.** The onchain wallet library publishes no build for ARM servers.
-- **This is the mint only.** Use any Cashu wallet to hold and spend the eCash your mint issues.
+- **phoenixd is the only Lightning backend.** Core Lightning and LND are not offered.

@@ -1,8 +1,7 @@
 import { configYaml } from '../fileModels/config.yaml'
 import { i18n } from '../i18n'
 import { sdk } from '../sdk'
-import { MINT_HOST, MINT_PORT } from '../mintEnvironment'
-import { ONCHAIN_STATUS_FILE } from '../mintEnvironment'
+import { MINT_HOST, MINT_PORT, ONCHAIN_STATUS_FILE } from '../mintEnvironment'
 import { depositMnemonicFile, mintDatabaseFile, mintSeedFile } from '../utils'
 
 export const showMintInfo = sdk.Action.withoutInput(
@@ -40,18 +39,18 @@ export const showMintInfo = sdk.Action.withoutInput(
       .catch(() => false)
 
     return {
-      version: '1' as const,
+      version: '1',
       title: i18n('Mint Status'),
       message: null,
       result: {
-        type: 'group' as const,
+        type: 'group',
         value: [
           {
             name: i18n('Mint Seed'),
             description: i18n(
               'Whether the eCash seed exists on the volume. Its value is never shown.',
             ),
-            type: 'single' as const,
+            type: 'single',
             value: hasSeed ? i18n('Present') : i18n('Missing'),
             copyable: false,
             qr: false,
@@ -63,7 +62,7 @@ export const showMintInfo = sdk.Action.withoutInput(
             description: i18n(
               'The wallet backend the mint settles payments through.',
             ),
-            type: 'single' as const,
+            type: 'single',
             value: 'PhoenixdWallet (phoenixd)',
             copyable: false,
             qr: false,
@@ -75,7 +74,7 @@ export const showMintInfo = sdk.Action.withoutInput(
             description: i18n(
               'Whether onchain deposits and withdrawals are switched on.',
             ),
-            type: 'single' as const,
+            type: 'single',
             value: onchainEnabled ? i18n('On') : i18n('Off'),
             copyable: false,
             qr: false,
@@ -87,7 +86,7 @@ export const showMintInfo = sdk.Action.withoutInput(
             description: i18n(
               "Whether the onchain deposit wallet's recovery phrase exists on the volume. Its value is never shown.",
             ),
-            type: 'single' as const,
+            type: 'single',
             value: hasDepositPhrase ? i18n('Present') : i18n('Missing'),
             copyable: false,
             qr: false,
@@ -99,7 +98,7 @@ export const showMintInfo = sdk.Action.withoutInput(
             description: i18n(
               "Confirmed sats in the deposit wallet waiting for the next sweep, as of the mint's last status update.",
             ),
-            type: 'single' as const,
+            type: 'single',
             value:
               typeof depositSats === 'number'
                 ? `${depositSats} sats`
@@ -114,7 +113,7 @@ export const showMintInfo = sdk.Action.withoutInput(
             description: i18n(
               'The address and port the mint binds inside its container.',
             ),
-            type: 'single' as const,
+            type: 'single',
             value: `${MINT_HOST}:${MINT_PORT}`,
             copyable: true,
             qr: false,
@@ -126,7 +125,7 @@ export const showMintInfo = sdk.Action.withoutInput(
             description: i18n(
               'Where the mint database is stored inside the container.',
             ),
-            type: 'single' as const,
+            type: 'single',
             value: mintDatabaseFile,
             copyable: false,
             qr: false,
@@ -136,7 +135,7 @@ export const showMintInfo = sdk.Action.withoutInput(
           {
             name: i18n('Log Level'),
             description: i18n('Current logging verbosity.'),
-            type: 'single' as const,
+            type: 'single',
             value: logLevel ?? 'INFO',
             copyable: false,
             qr: false,

@@ -6,37 +6,10 @@ Develop it inside a StartOS packaging workspace created by `start-cli s9pk init-
 which provides the packaging guide and agent context one level up. If you're reading this in a
 bare clone with no workspace, the full guide is at <https://docs.start9.com/packaging>.
 
-**Start every task at the recipe index** — `../start-technologies/projects/start-sdk/docs/src/recipes.md`
-(or <https://docs.start9.com/packaging/recipes.html>). It maps an intent ("prompt the user to create
-admin credentials", "expose a web UI") to the constructs, the reference pages, and a named production
-package to copy. Find the recipe before you read this package's neighbours: a package you reach by
-grepping may be non-conformant, and the recipe outranks it.
-
-Freshly scaffolded? Work the
-[New Package Checklist](../start-technologies/projects/start-sdk/docs/src/new-package-checklist.md)
-(or <https://docs.start9.com/packaging/new-package-checklist.html>) from top to bottom. It is a
-guide page, not a file in this repo — read it, don't copy it in.
-
-Keep `README.md` (technical reference for an AI support or administering agent) and
-`instructions.md` (end-user docs) in sync with your changes. This file restates neither:
-whoever changes the package has both, so it carries only what they don't — repo mechanics,
-a change that looks right and is not, where the next thing gets added, a naming trap, a
-build or test invocation particular to this repo.
-
-**Fix a defect you spot rather than reporting it** — you have the package open and the
-context to be sure. File **a GitHub issue on this repo** only when the call isn't yours to
-make: you can't pin the cause down, two defensible fixes exist, or it's too large to ride on
-the work in hand. An open issue is a report, not a queue — implement one when you're asked
-to or when it's labelled `Approved`, then close it with `Closes #<n>`.
-
-Don't record work in the repo instead: no `TODO.md`, no `NOTES.md`, no `PLAN.md`. What you
-verified, tried, and decided belongs in the commit message and the PR body.
-
 ## This repo
 
 - **Never make the seed write in `init/generateMintSeed.ts` unconditional.** Restore replays init as `kind === 'install'`, and a fresh `mint_private_key` orphans every token the mint has issued. The same holds for the deposit phrase: the `deposit-wallet` oneshot in `main.ts` opens it with `O_EXCL` and must never overwrite it.
 - **Bump the `Dockerfile` digest, the `upstream-project` submodule and `patches/` together**, as `UPDATING.md` describes; any one alone builds a different mint than the one tested.
-- **Mount only the read-only `stats` volume in the dashboard.** The collector needs the `mint/` subdirectory to read the live WAL database. The dashboard must never receive the ledger, mint seed, deposit wallet, or phoenixd configuration. Keep the dashboard setup task `important` so the mint can run by itself.
-- **Keep `startos/mintEnvironment.ts` import-free.** `tests/mint-environment.test.ts` runs it under plain `node --test`, where a relative import breaks the test.
+- **Mount phoenixd's `public` volume at `full`, never its `main`**, which holds phoenixd's seed.
+- **Mount only the read-only `stats` volume in the dashboard.** The dashboard must never receive the ledger, mint seed, deposit wallet, or phoenixd's password. Keep the dashboard's setup task `important` so the mint can run by itself.
 - **Keep `main.ts` refusing to start when phoenixd's address or password can't be read, or when onchain is on and Fulcrum is unreachable.** A mint without its backend takes deposits it cannot settle.
-- **Don't import constants from `phoenixd-startos` or `fulcrum-startos`, or widen `tsconfig.json`'s `include` to `node_modules`.** Both pull in `electrs-startos`, whose `#next` does not type-check; the ids and ports are inlined in `startos/utils.ts`.

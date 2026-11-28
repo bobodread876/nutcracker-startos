@@ -5,7 +5,7 @@ export const manifest = setupManifest({
   id: 'nutcracker',
   title: 'Nutcracker',
   license: 'MIT',
-  packageRepo: 'https://github.com/bobodread876/nutcracker-startos',
+  packageRepo: 'https://github.com/Start9-Community/nutcracker-startos',
   upstreamRepo: 'https://github.com/cashubtc/nutshell',
   marketingUrl: 'https://cashu.space',
   donationUrl: null,

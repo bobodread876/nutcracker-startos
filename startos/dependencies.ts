@@ -10,7 +10,7 @@ export const dependencies = sdk.Dependencies.of()
         title: 'phoenixd',
         icon: 'https://raw.githubusercontent.com/Start9-Community/phoenixd-startos/refs/heads/master/icon.svg',
       },
-      versionRange: '>=0.9.2:2',
+      versionRange: '>=0.9.2:4',
       kind: 'running',
       healthChecks: ['primary'],
     }),
